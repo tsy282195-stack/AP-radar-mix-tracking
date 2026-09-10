@@ -1149,7 +1149,29 @@ end
 
 function ids = collect_confirmed_ids(est, fallback_output_ids)
 ids = zeros(1, 0);
-if isstruct(est) && isfield(est, 'logical_tracks')
+
+% Current joint-filter results retain transition_log independently of
+% history_level. The logical_confirm_* transitions are therefore the
+% authoritative source for logical IDs that have ever reached confirmed
+% state, including a track confirmed directly into hold without output.
+if isstruct(est) && isfield(est, 'transition_log') && ~isempty(est.transition_log)
+    log = est.transition_log;
+    if isfield(log, 'id') && isfield(log, 'reason')
+        reasons = {log.reason};
+        is_confirm = false(size(reasons));
+        for q = 1:numel(reasons)
+            reason = reasons{q};
+            is_confirm(q) = ischar(reason) && strncmp(reason, 'logical_confirm_', 16);
+        end
+        if any(is_confirm)
+            ids = reshape([log(is_confirm).id], 1, []);
+        end
+    end
+end
+
+% Compatibility fallback for older or synthetic estimates that do not
+% contain confirmation transitions but do retain diagnostic/full snapshots.
+if isempty(ids) && isstruct(est) && isfield(est, 'logical_tracks')
     counts = zeros(numel(est.logical_tracks), 1);
     for k = 1:numel(est.logical_tracks)
         tracks = est.logical_tracks{k};
