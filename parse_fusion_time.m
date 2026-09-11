@@ -15,7 +15,8 @@ switch lower(strtrim(char(format)))
             m = str2double(fields{2});
             s = str2double(fields{3});
         else
-            token = regexp(text, '^([0-9]{1,6})([.][0-9]+)?$', 'tokens', 'once');
+            token = regexp(text, '^([0-9]{1,6})([.][0-9]+)?$', ...
+                'tokens', 'once');
             if isempty(token), t_sec = NaN; return; end
             whole = token{1};
             whole = [repmat('0', 1, 6 - numel(whole)), whole];

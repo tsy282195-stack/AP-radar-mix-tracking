@@ -132,8 +132,7 @@ for s = 1:n_sel
         if isempty(hFilt), hFilt = h; end
         plot3(ax, EST(s).p(1, 1), EST(s).p(2, 1), EST(s).p(3, 1), 'o', ...
               'MarkerEdgeColor', 'k', 'MarkerFaceColor', col, 'MarkerSize', 5);
-        text(ax, EST(s).p(1, 1), EST(s).p(2, 1), EST(s).p(3, 1), sprintf(' est%g', sel_ids(s)), ...
-             'Color', col, 'FontSize', 8, 'FontWeight', 'bold', 'VerticalAlignment', 'bottom');
+        annotate_track_start(ax, EST(s).p, sel_ids(s), col);
     end
     % 二次平滑轨迹（粗线，同色）
     tk = local_get_smoothed(smt, sel_ids(s));
@@ -141,6 +140,9 @@ for s = 1:n_sel
         h = plot3(ax, tk.smooth(1, :), tk.smooth(2, :), tk.smooth(3, :), '-', ...
                   'Color', col, 'LineWidth', smooth_width);
         if isempty(hSmooth), hSmooth = h; end
+        if EST(s).n == 0
+            annotate_track_start(ax, tk.smooth, sel_ids(s), col);
+        end
     end
 end
 

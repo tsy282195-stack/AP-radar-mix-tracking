@@ -7,69 +7,12 @@ function pairs = solve_global_assignment(cost, unmatched_cost)
 
 [n, m] = size(cost);
 pairs = zeros(0, 2);
+if n == 0 || m == 0 || ~any(isfinite(cost(:)))
+    return;
+end
 if ~isscalar(unmatched_cost) || ~isfinite(unmatched_cost)
     error('solve_global_assignment:InvalidUnmatchedCost', ...
         'unmatched_cost must be a finite scalar.');
-end
-if n == 0 || m == 0
-    return;
-end
-
-% Edges above the unmatched-row cost can never improve the objective.
-% Remove isolated rows/columns and solve disconnected gated components
-% independently; unused measurement columns carry no penalty.
-eligible = isfinite(cost) & cost <= unmatched_cost;
-active_rows = find(any(eligible, 2));
-active_cols = find(any(eligible, 1));
-if isempty(active_rows) || isempty(active_cols)
-    return;
-end
-edge = sparse(eligible(active_rows, active_cols));
-components = finite_edge_components(edge);
-for k = 1:numel(components)
-    rows = components(k).rows;
-    cols = components(k).cols;
-    local = solve_dense_assignment( ...
-        cost(active_rows(rows), active_cols(cols)), unmatched_cost);
-    if isempty(local), continue; end
-    mapped_rows = active_rows(rows(local(:, 1)));
-    mapped_cols = active_cols(cols(local(:, 2)));
-    pairs = [pairs; mapped_rows(:), mapped_cols(:)]; %#ok<AGROW>
-end
-if ~isempty(pairs)
-    pairs = sortrows(pairs, [1, 2]);
-end
-end
-
-function components = finite_edge_components(edge)
-n_row = size(edge, 1);
-seen_row = false(n_row, 1);
-components = repmat(struct('rows', zeros(1, 0), ...
-    'cols', zeros(1, 0)), n_row, 1);
-n_component = 0;
-for seed = 1:n_row
-    if seen_row(seed), continue; end
-    row_mask = false(n_row, 1); row_mask(seed) = true;
-    col_mask = false(1, size(edge, 2));
-    while true
-        next_col = any(edge(row_mask, :), 1);
-        next_row = any(edge(:, next_col), 2);
-        if isequal(next_row, row_mask) && isequal(next_col, col_mask), break; end
-        row_mask = next_row; col_mask = next_col;
-    end
-    seen_row(row_mask) = true;
-    n_component = n_component + 1;
-    components(n_component) = struct( ...
-        'rows', find(row_mask).', 'cols', find(col_mask));
-end
-components = components(1:n_component);
-end
-
-function pairs = solve_dense_assignment(cost, unmatched_cost)
-[n, m] = size(cost);
-pairs = zeros(0, 2);
-if n == 0 || m == 0 || ~any(isfinite(cost(:)))
-    return;
 end
 
 large = max(1, abs(unmatched_cost)) * 1e9;
@@ -110,7 +53,7 @@ for i = 1:n
                 'Failed to construct a finite assignment.');
         end
         for j = 1:ncol + 1
-             if used(j)
+            if used(j)
                 u(p(j) + 1) = u(p(j) + 1) + delta;
                 v(j) = v(j) - delta;
             else

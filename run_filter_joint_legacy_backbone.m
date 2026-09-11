@@ -7,6 +7,8 @@ K = numel(fused_xyz);
 if nargin < 9, source_events = []; end
 if isempty(passive_bearing), passive_bearing = cell(K, 1); end
 passive_enabled = logical(get_cfg(cfg, 'passive_bearing_enabled', true));
+[~, n_passive_before_selection, n_active_before_selection] = ...
+    angle_source_counts(passive_bearing);
 [passive_bearing, ~] = select_enabled_angle_sources( ...
     passive_bearing, passive_enabled);
 
@@ -19,6 +21,14 @@ n_active_range = sum(cellfun(@(z) size(z, 2), fused_xyz));
 has_angle = n_angle > 0;
 events = make_filter_events(fused_xyz, fused_R, frame_times, passive_bearing, ...
     fused_ids, platform, cfg, source_events);
+backbone_event_meta = event_meta;
+if isempty(backbone_event_meta)
+    % The mature 3-D API historically assumes active-only events when its
+    % metadata argument is omitted.  Preserve that standalone behavior in
+    % the backbone, but supply truthful wrapper metadata so a pure-passive
+    % call can advance the online mature 2-D confirmation controller.
+    backbone_event_meta = infer_backbone_event_meta(events);
+end
 
 fprintf(['  联合输入能力: 主动RAE=%d, 独立AE=%d ' ...
     '(被动=%d, 主动AE-only=%d)\n'], ...
@@ -37,7 +47,7 @@ cfg3.passive_bearing_fast_gate_deg = get_cfg(cfg, ...
 cfg3.use_target_id_prior = false;
 
 est3 = run_filter_adapt_ckf(fused_xyz, fused_R, frame_times, cfg3, ...
-    passive_bearing, platform, fused_ids, event_meta);
+    passive_bearing, platform, fused_ids, backbone_event_meta);
 
 if has_angle
     if ~isfield(est3, 'joint2d') || isempty(est3.joint2d)
@@ -66,9 +76,16 @@ est.processing_passes = 1;
 est.processing_architecture = processing_architecture;
 est.stats.angle_shard_inputs = shard_stats.n_input;
 est.stats.angle_shard_duplicates = shard_stats.n_removed;
+est.stats.angle_shard_duplicates_passive = shard_stats.n_removed_passive;
+est.stats.angle_shard_duplicates_active = shard_stats.n_removed_active;
 est.stats.input_active_rae = n_active_range;
 est.stats.input_passive_ae = n_passive_angle;
 est.stats.input_active_ae_only = n_active_angle;
+est.stats.input_passive_disabled = max(0, n_passive_before_selection - ...
+    n_passive_angle - shard_stats.n_removed_passive);
+est.stats.input_active_ae_disabled = max(0, n_active_before_selection - ...
+    n_active_angle - shard_stats.n_removed_active);
+print_joint_contract_summary(est);
 end
 
 function [n_total, n_passive, n_active] = angle_source_counts(pb)
@@ -174,6 +191,42 @@ fprintf(['    漏斗: 活动新ID=%g, 旧companion=%g, 投影无效=%g, ' ...
     field_or(s, 'external_rebind_wait_bound', 0));
 end
 
+function print_joint_contract_summary(est)
+s = est.stats;
+fprintf('\n[架构]\n');
+fprintf('  3D backbone = run_filter_adapt_ckf\n');
+fprintf('  2D backbone = mature passive IMM-KF in run_filter_joint_2d3d\n');
+fprintf('  manager     = run_filter_joint_legacy_backbone\n');
+fprintf('[主动RAE去向]\n');
+fprintf(['  输入=%g, 关联成熟3D=%g, 新生=%g, 明确抑制=%g, ' ...
+    '未解释=%g, 正式3D输出点=%g\n'], ...
+    field_or(s, 'active_measurements', 0), ...
+    field_or(s, 'active_assigned', 0), field_or(s, 'active_births', 0), ...
+    field_or(s, 'active_birth_suppressed', 0), ...
+    field_or(s, 'active_unaccounted', 0), sum(est.N));
+fprintf('[被动AE去向]\n');
+fprintf(['  输入=%g, ->3D branch=%g, ->2D branch=%g, 未送入支路=%g, ' ...
+    '明确抑制=%g, 未解释=%g, 正式2D输出点=%g\n'], ...
+    field_or(s, 'passive_measurements', 0), ...
+    field_or(s, 'passive_to_3d', 0), field_or(s, 'passive_to_2d', 0), ...
+    field_or(s, 'passive_not_routed', 0), ...
+    field_or(s, 'passive_birth_suppressed', 0), ...
+    field_or(s, 'passive_unaccounted', 0), sum(est.N2));
+fprintf('[切换]\n');
+fprintf(['  pending 3D->2D事件记录=%g, committed 3D->2D=%g, ' ...
+    'blocked: 2D not ready=%g\n'], ...
+    field_or(s, 'pending_3d_to_2d_event_records', 0), ...
+    field_or(s, 'switch_3d_to_2d_committed', 0), ...
+    field_or(s, 'switch_3d_to_2d_blocked_not_ready', 0));
+fprintf(['  pending 2D->3D事件记录=%g, committed 2D->3D=%g, ' ...
+    '3D shadow/rebind候选输出=%g\n'], ...
+    field_or(s, 'pending_2d_to_3d_event_records', 0), ...
+    field_or(s, 'switch_2d_to_3d_committed', 0), ...
+    field_or(s, 'shadow_3d_candidates', 0));
+fprintf('  同一事件重复正式逻辑输出抑制=%g\n', ...
+    field_or(s, 'duplicate_outputs_suppressed', 0));
+end
+
 function [pb, has_active_angle] = select_enabled_angle_sources(pb, passive_enabled)
 has_active_angle = false;
 for k = 1:numel(pb)
@@ -208,7 +261,8 @@ end
 end
 
 function [pb, stats] = dedup_angle_packets(pb, cfg)
-stats = struct('n_input', 0, 'n_removed', 0);
+stats = struct('n_input', 0, 'n_removed', 0, ...
+    'n_removed_passive', 0, 'n_removed_active', 0);
 for k = 1:numel(pb)
     if ~isempty(pb{k}) && isstruct(pb{k})
         stats.n_input = stats.n_input + size(field_or( ...
@@ -245,7 +299,10 @@ for k = 1:numel(pb)
     end
     R = normalize_covariance(field_or(pb{k}, 'R_deg2', []), 2, n, eye(2));
     ids = sized_row(field_or(pb{k}, 'tracklet_id', []), n, NaN);
-    stats.n_removed = stats.n_removed + n - numel(keep);
+    removed = true(1, n); removed(keep) = false;
+    stats.n_removed = stats.n_removed + nnz(removed);
+    stats.n_removed_passive = stats.n_removed_passive + nnz(removed & kind == 1);
+    stats.n_removed_active = stats.n_removed_active + nnz(removed & kind == 2);
     pb{k}.ang_deg = ang(:, keep); pb{k}.R_deg2 = R(:, :, keep);
     pb{k}.src = src(keep); pb{k}.kind = kind(keep);
     pb{k}.shard = shard(keep);
@@ -302,6 +359,23 @@ for k = 1:K
 end
 end
 
+function meta = infer_backbone_event_meta(events)
+K = numel(events);
+meta = repmat(struct('has_active', false, 'has_passive', false, ...
+    'miss_cycle', false, 'confirm_cycle', false, ...
+    'n_active', 0, 'n_passive', 0, 't_start', NaN, 't_end', NaN), K, 1);
+for k = 1:K
+    meta(k).has_active = logical(events(k).has_active);
+    meta(k).has_passive = logical(events(k).has_passive);
+    meta(k).miss_cycle = meta(k).has_active;
+    meta(k).confirm_cycle = meta(k).has_active;
+    meta(k).n_active = events(k).active.n_meas;
+    meta(k).n_passive = events(k).passive.n_meas;
+    meta(k).t_start = events(k).t_start;
+    meta(k).t_end = events(k).t_end;
+end
+end
+
 function map = online_residual_map(est2)
 K = numel(est2.event_meta); map = cell(K, 1);
 for k = 1:K
@@ -318,30 +392,58 @@ function est = assemble_joint_estimate(e3, e2, events, residual_map, ...
         offset, platform, cfg)
 K = numel(events); est = init_joint_estimate(K, events);
 duplicate_outputs_suppressed = 0;
+shadow_candidate_outputs = 0;
 mature3d = e3;
 if isfield(mature3d, 'joint2d'), mature3d = rmfield(mature3d, 'joint2d'); end
 est.mature3d = mature3d; est.passive2d = e2;
 for k = 1:K
     out = repmat(output_template(), 0, 1);
+    shadow_out = repmat(output_template(), 0, 1);
     sensor = platform_enu(events(k).t_sec, platform, cfg);
-    companions = companions_at(e2, k);
+    companions = decorate_companion_transactions(companions_at(e2, k), offset);
+    est.switch_transactions{k} = companions;
     active_ids = legacy_assoc_ids(e3, k);
     passive_ids = passive_update_ids(e3, k);
     if k <= numel(e3.X) && ~isempty(e3.X{k})
         labels = e3.L{k};
+        external_ids = reshape(labels(:, 2), 1, []);
+        [pending_index, companion_index, mapped_ids] = ...
+            external_branch_lookup(external_ids, companions, offset);
+        mature_last_updates = external_track_last_updates(e3, k, external_ids);
+        active_hit = ismember(external_ids, active_ids);
+        passive_hit = ismember(external_ids, passive_ids);
         for j = 1:size(e3.X{k}, 2)
-            external_id = labels(j, 2);
-            if ~isempty(companion_pending_external(companions, external_id))
+            external_id = external_ids(j);
+            if pending_index(j) > 0
+                pending_owner = companions(pending_index(j));
+                % The replacement 3-D branch is observable for diagnostics
+                % but is not formal before the mapping transaction commits.
+                birth_event = labels(j, 1);
+                shadow = make_3d_output(external_id, birth_event, ...
+                    events(k).t_sec, e3.X{k}(:, j), e3.P{k}(:, :, j), ...
+                    external_id, active_hit(j), passive_hit(j), [], sensor, ...
+                    mature_last_updates(j));
+                shadow.formal = false;
+                shadow.mode = 'shadow_3d_rebind_candidate';
+                shadow.switch_state = pending_owner.switch_state;
+                shadow.shadow_for_logical_id = pending_owner.logical_id;
+                shadow_out(end + 1, 1) = shadow; %#ok<AGROW>
+                shadow_candidate_outputs = shadow_candidate_outputs + 1;
                 continue;
             end
-            companion = companion_for_external(companions, external_id);
-            if ~isempty(companion) && companion.output_dim ~= 3, continue; end
-            id = logical_id_for_external(external_id, companion, offset);
+            companion = repmat(companion_template(), 0, 1);
+            if companion_index(j) > 0
+                companion = companions(companion_index(j));
+            end
+            if ~isempty(companion) && companion.active_output_dim ~= 3
+                continue;
+            end
+            id = mapped_ids(j);
             birth_event = logical_birth_event(labels(j, 1), companion);
-            mature_last_update = external_track_last_update(e3, k, external_id);
             o = make_3d_output(id, birth_event, events(k).t_sec, ...
                 e3.X{k}(:, j), e3.P{k}(:, :, j), external_id, ...
-                active_ids, passive_ids, companion, sensor, mature_last_update);
+                active_hit(j), passive_hit(j), companion, sensor, ...
+                mature_last_updates(j));
             out(end + 1, 1) = o; %#ok<AGROW>
         end
     end
@@ -352,18 +454,21 @@ for k = 1:K
     for j = 1:numel(companions)
         q = companions(j);
         id = logical_id_for_external(q.external_3d_id, q, offset);
-        if q.output_dim == 3 && ~any([out.id] == id)
+        if q.active_output_dim == 3 && q.output_dim == 3 && ...
+                ~any([out.id] == id)
             [x, P, birth_event, found] = external_track_state(e3, k, q.external_3d_id);
             if found
                 birth_event = logical_birth_event(birth_event, q);
                 mature_last_update = external_track_last_update( ...
                     e3, k, q.external_3d_id);
                 o = make_3d_output(id, birth_event, events(k).t_sec, x, P, ...
-                    q.external_3d_id, active_ids, passive_ids, q, sensor, ...
+                    q.external_3d_id, ismember(q.external_3d_id, active_ids), ...
+                    ismember(q.external_3d_id, passive_ids), q, sensor, ...
                     mature_last_update);
                 out(end + 1, 1) = o; %#ok<AGROW>
             end
-        elseif q.output_dim == 2 && ~any([out.id] == id)
+        elseif q.active_output_dim == 2 && q.output_dim == 2 && ...
+                ~any([out.id] == id)
             o = make_companion_2d_output(q, id, events(k).t_sec);
             out(end + 1, 1) = o; %#ok<AGROW>
         end
@@ -381,16 +486,23 @@ for k = 1:K
             o.mode = '2d_angle_only'; o.status_code = 1; o.truth_id = q.truth_id;
             o.az_deg = q.az_deg; o.el_deg = q.el_deg;
             o.angle_state = q.angle_state; o.angle_cov = q.angle_cov;
+            o.logical_id = id; o.branch_2d_id = q.id;
+            o.active_output_dim = 2; o.switch_state = 'stable_2d';
             out(end + 1, 1) = o; %#ok<AGROW>
         end
     end
     [out, n_duplicate] = arbitrate_logical_outputs(out);
     duplicate_outputs_suppressed = duplicate_outputs_suppressed + n_duplicate;
+    validate_transaction_event(out, companions, k);
     est.output{k} = out;
+    est.shadow_output{k} = shadow_out;
     est = store_joint_event(est, e3, e2, events, residual_map, ...
         k, out, offset, companions);
 end
-est.transition_log = build_transition_log(est);
+est.output_status_log = build_transition_log(est);
+est.transition_log = map_manager_transition_log( ...
+    field_or(e2, 'transition_log', struct([])), est.switch_transactions, ...
+    est.filter_times, offset);
 est.framework = 'joint_2d3d';
 est.backbone = 'mature_active3d';
 est.status_legend = struct('angle_only_2d', 1, 'passive_2d', 1, 'active_3d', 2, ...
@@ -405,7 +517,24 @@ est.stats = struct('active_births', field_or(e3.birth_stats, 'n_total', 0), ...
     'cross_dimension_suppressed', field_or(e2.stats, 'cross_dimension_suppressed', 0), ...
     'passive_duplicate_merges', field_or(e2.stats, 'duplicates_merged', 0), ...
     'external_rebinds', field_or(e2.stats, 'external_rebind_committed', 0), ...
+    'switch_3d_to_2d_committed', field_or(e2.stats, ...
+        'switch_3d_to_2d_committed', 0), ...
+    'switch_2d_to_3d_committed', field_or(e2.stats, ...
+        'switch_2d_to_3d_committed', 0), ...
+    'switch_3d_to_2d_blocked_not_ready', field_or(e2.stats, ...
+        'switch_3d_to_2d_blocked_not_ready', 0), ...
+    'shadow_3d_candidates', shadow_candidate_outputs, ...
     'duplicate_outputs_suppressed', duplicate_outputs_suppressed);
+switch_stats = summarize_switch_transactions(est.switch_transactions);
+switch_names = fieldnames(switch_stats);
+for switch_index = 1:numel(switch_names)
+    est.stats.(switch_names{switch_index}) = switch_stats.(switch_names{switch_index});
+end
+ledger = summarize_measurement_disposition(est.measurement_disposition);
+ledger_names = fieldnames(ledger);
+for ledger_index = 1:numel(ledger_names)
+    est.stats.(ledger_names{ledger_index}) = ledger.(ledger_names{ledger_index});
+end
 est.output_freshness = struct( ...
     'three_d', field_or(e3, 'output_freshness', struct()), ...
     'two_d', struct('max_silence_s', get_cfg(cfg, ...
@@ -414,22 +543,23 @@ est.output_freshness = struct( ...
 end
 
 function o = make_3d_output(id, birth_event, t, x, P, external_id, ...
-        active_ids, passive_ids, companion, sensor, mature_last_update)
+        active_hit, passive_hit, companion, sensor, mature_last_update)
 o = output_template();
 o.id = id; o.birth_event = birth_event; o.t_sec = t;
 o.output_dim = 3; o.confirmed = true; o.state3d = x; o.cov3d = P;
+o.logical_id = id; o.branch_3d_id = external_id; o.active_output_dim = 3;
+o.switch_state = 'stable_3d';
 o.position_enu = x([1, 4, 7]); o.velocity_enu = x([2, 5, 8]);
 o.acceleration_enu = x([3, 6, 9]);
 o.last_update_t = mature_last_update;
 rel = o.position_enu - sensor;
 o.az_deg = atan2d(rel(1), rel(2));
 o.el_deg = atan2d(rel(3), hypot(rel(1), rel(2))); o.range_m = norm(rel);
-ha = ismember(external_id, active_ids); hp = ismember(external_id, passive_ids);
-if ha && hp
+if active_hit && passive_hit
     o.status_code = 3; o.mode = '3d_active_passive';
-elseif ha
+elseif active_hit
     o.status_code = 2; o.mode = '3d_active';
-elseif hp
+elseif passive_hit
     o.status_code = 4; o.mode = '3d_passive_maintained';
 else
     o.status_code = 5; o.mode = '3d_coast';
@@ -438,9 +568,57 @@ if ~isempty(companion)
     o.last_update_t = companion.last_update_t;
     o.quality = companion.quality;
     o.mode = companion.mode;
-elseif ha || hp
+    o.branch_2d_id = companion.branch_2d_id;
+    o.switch_state = companion.switch_state;
+elseif active_hit || passive_hit
     o.last_update_t = t;
 end
+end
+
+function [pending_index, companion_index, logical_ids] = ...
+        external_branch_lookup(external_ids, companions, offset)
+pending_index = lookup_companion_indices( ...
+    external_ids, companions, 'pending_external_3d_id');
+companion_index = lookup_companion_indices( ...
+    external_ids, companions, 'external_3d_id');
+logical_ids = external_ids;
+for q = find(companion_index > 0)
+    c = companions(companion_index(q));
+    if c.from_2d && isfinite(c.local_2d_id)
+        logical_ids(q) = c.local_2d_id + offset;
+    elseif isfinite(c.logical_id) && c.logical_id > 0
+        logical_ids(q) = c.logical_id;
+    end
+end
+end
+
+function indices = lookup_companion_indices(query, companions, field_name)
+indices = zeros(size(query));
+if isempty(query) || isempty(companions) || ~isfield(companions, field_name)
+    return;
+end
+values = reshape([companions.(field_name)], 1, []);
+valid = isfinite(values);
+if ~any(valid), return; end
+source_indices = find(valid);
+[unique_values, first_local] = unique(values(valid), 'stable');
+first_indices = source_indices(first_local);
+[found, location] = ismember(query, unique_values);
+indices(found) = first_indices(location(found));
+end
+
+function values = external_track_last_updates(e3, k, external_ids)
+values = nan(size(external_ids));
+if isempty(external_ids) || k > numel(e3.tracks) || isempty(e3.tracks{k})
+    return;
+end
+s = e3.tracks{k};
+if ~isfield(s, 'L') || isempty(s.L) || ~isfield(s, 'last_update_t')
+    return;
+end
+[found, location] = ismember(external_ids, s.L(2, :));
+valid = found & location <= numel(s.last_update_t);
+values(valid) = s.last_update_t(location(valid));
 end
 
 function t = external_track_last_update(e3, k, external_id)
@@ -458,6 +636,9 @@ function o = make_companion_2d_output(q, id, t)
 o = output_template();
 o.id = id; o.birth_event = q.birth_event; o.t_sec = t;
 o.output_dim = 2; o.confirmed = q.confirmed; o.status_code = 6;
+o.logical_id = id; o.branch_3d_id = q.branch_3d_id;
+o.branch_2d_id = q.branch_2d_id; o.active_output_dim = 2;
+o.switch_state = q.switch_state;
 o.last_update_t = q.last_update_t;
 o.mode = q.mode; o.angle_state = q.angle_state; o.angle_cov = q.angle_cov;
 o.az_deg = q.angle_state(1); o.el_deg = q.angle_state(4); o.quality = q.quality;
@@ -471,15 +652,13 @@ if isempty(idx2)
     est.X2{k} = zeros(6, 0); est.P2{k} = zeros(6, 6, 0); est.L2{k} = zeros(0, 2);
 else
     est.X2{k} = cat(2, out(idx2).angle_state); est.P2{k} = cat(3, out(idx2).angle_cov);
-    birth_events = [out(idx2).birth_event]; output_ids = [out(idx2).id];
-    est.L2{k} = [birth_events(:), output_ids(:)];
+    est.L2{k} = [[out(idx2).birth_event].', [out(idx2).id].'];
 end
 if isempty(idx3)
     est.X{k} = []; est.P{k} = []; est.L{k} = [];
 else
     est.X{k} = cat(2, out(idx3).state3d); est.P{k} = cat(3, out(idx3).cov3d);
-    birth_events = [out(idx3).birth_event]; output_ids = [out(idx3).id];
-    est.L{k} = [birth_events(:), output_ids(:)];
+    est.L{k} = [[out(idx3).birth_event].', [out(idx3).id].'];
 end
 est.mode_counts.n2d(k) = est.N2(k); est.mode_counts.n3d(k) = est.N(k);
 if isempty(out)
@@ -490,30 +669,38 @@ end
 est.logical_tracks{k} = outputs_to_snapshots(out);
 if k <= numel(e3.tracks), est.tracks{k} = e3.tracks{k}; end
 est.companions{k} = companions;
-est.assoc{k} = combine_assoc(e3, e2, events, residual_map, k, ...
-    offset, companions);
+    est.assoc{k} = combine_assoc(e3, e2, events, residual_map, k, ...
+        offset, companions);
+    est.measurement_disposition{k} = build_measurement_disposition( ...
+        est.assoc{k}, events(k), k);
 end
 
 function a = combine_assoc(e3, e2, events, residual_map, k, offset, companions)
 a = assoc_template();
 if k <= numel(e3.assoc) && ~isempty(e3.assoc{k})
     x = e3.assoc{k}; n = numel(x.id);
+    mapped_ids = committed_logical_ids(x.id, companions, offset);
     for q = 1:n
         mi = indexed(x, 'meas_index', q, q);
         if mi < 1 || mi > events(k).active.n_meas, continue; end
-        id = logical_id_for_external(x.id(q), ...
-            companion_for_external_or_pending(companions, x.id(q)), offset);
+        id = mapped_ids(q);
         [innovation, nis, group_size, innovation_kind] = assoc_diagnostic(x, q);
-        a = append_assoc(a, id, 'active', mi, indexed(x, 'tid', q, NaN), ...
+        assoc_type = 'active';
+        if isfield(x, 'type') && iscell(x.type) && q <= numel(x.type) && ...
+                ischar(x.type{q}) && strcmp(x.type{q}, 'active_birth')
+            assoc_type = 'active_birth';
+        end
+        a = append_assoc(a, id, assoc_type, mi, indexed(x, 'tid', q, NaN), ...
             events(k).active.rae(2:3, mi), events(k).active.xyz(:, mi), ...
             NaN, 3, innovation, nis, group_size, innovation_kind);
     end
 end
 if k <= numel(e3.passive_assoc) && ~isempty(e3.passive_assoc{k})
     d = e3.passive_assoc{k}; jj = find(d.used_mask & isfinite(d.track_id));
-    for mi = jj
-        id = logical_id_for_external(d.track_id(mi), ...
-            companion_for_external_or_pending(companions, d.track_id(mi)), offset);
+    mapped_ids = committed_logical_ids(d.track_id(jj), companions, offset);
+    for r = 1:numel(jj)
+        mi = jj(r);
+        id = mapped_ids(r);
         [innovation, nis, group_size, innovation_kind] = assoc_diagnostic(d, mi);
         a = append_assoc(a, id, 'passive', mi, ...
             events(k).passive.ids(mi), events(k).passive.ang(:, mi), ...
@@ -533,11 +720,32 @@ if k <= numel(e2.assoc) && ~isempty(e2.assoc{k})
         else
             id = x.id(q) + offset;
         end
+        assoc_type = 'passive';
+        if q <= numel(x.type) && ischar(x.type{q}) && ...
+                strcmp(x.type{q}, 'passive_birth')
+            assoc_type = 'passive_birth';
+        end
         [innovation, nis, group_size, innovation_kind] = assoc_diagnostic(x, q);
-        a = append_assoc(a, id, 'passive', mi, events(k).passive.ids(mi), ...
+        filter_dim = indexed(x, 'filter_dim', q, 2);
+        input_dim = indexed(x, 'input_dim', q, filter_dim);
+        a = append_assoc(a, id, assoc_type, mi, events(k).passive.ids(mi), ...
             events(k).passive.ang(:, mi), nan(3, 1), ...
-            indexed(x, 'cost', q, NaN), 2, innovation, nis, ...
-            group_size, innovation_kind);
+            indexed(x, 'cost', q, NaN), filter_dim, innovation, nis, ...
+            group_size, innovation_kind, input_dim);
+    end
+end
+end
+
+function ids = committed_logical_ids(external_ids, companions, offset)
+ids = reshape(external_ids, 1, []);
+if isempty(ids) || isempty(companions), return; end
+companion_index = lookup_companion_indices(ids, companions, 'external_3d_id');
+for q = find(companion_index > 0)
+    c = companions(companion_index(q));
+    if c.from_2d && isfinite(c.local_2d_id)
+        ids(q) = c.local_2d_id + offset;
+    elseif isfinite(c.logical_id) && c.logical_id > 0
+        ids(q) = c.logical_id;
     end
 end
 end
@@ -550,29 +758,113 @@ if isfield(est2, 'companions') && k <= numel(est2.companions) && ...
 end
 end
 
-function q = companion_for_external(companions, external_id)
-q = repmat(companion_template(), 0, 1);
-if isempty(companions) || ~isfinite(external_id), return; end
-i = find([companions.external_3d_id] == external_id, 1);
-if ~isempty(i), q = companions(i); end
+function companions = decorate_companion_transactions(companions, offset)
+for i = 1:numel(companions)
+    q = companions(i);
+    companions(i).branch_3d_id = q.external_3d_id;
+    companions(i).branch_2d_id = q.local_2d_id;
+    if q.from_2d && isfinite(q.local_2d_id)
+        companions(i).logical_id = q.local_2d_id + offset;
+    elseif isfinite(q.external_3d_id)
+        companions(i).logical_id = q.external_3d_id;
+    end
+    if ~isfield(q, 'active_output_dim') || q.active_output_dim == 0
+        if startsWith(q.mode, '3d')
+            companions(i).active_output_dim = 3;
+        elseif startsWith(q.mode, '2d')
+            companions(i).active_output_dim = 2;
+        end
+    end
+    if ~isfield(q, 'switch_state') || isempty(q.switch_state)
+        if isfinite(q.pending_external_3d_id)
+            companions(i).switch_state = 'pending_2d_to_3d';
+        elseif companions(i).active_output_dim == 3
+            companions(i).switch_state = 'stable_3d';
+        elseif companions(i).active_output_dim == 2
+            companions(i).switch_state = 'stable_2d';
+        else
+            companions(i).switch_state = 'hold_recovery';
+        end
+    end
+end
 end
 
-function q = companion_pending_external(companions, external_id)
-q = repmat(companion_template(), 0, 1);
-if isempty(companions) || ~isfinite(external_id), return; end
-i = find([companions.pending_external_3d_id] == external_id, 1);
-if ~isempty(i), q = companions(i); end
+function validate_transaction_event(out, companions, event_index)
+ids = reshape([out.id], 1, []);
+if numel(unique(ids)) ~= numel(ids)
+    error('run_filter_joint_legacy_backbone:DuplicateFormalOutput', ...
+        'Event %d contains duplicate formal output for one logical ID.', ...
+        event_index);
+end
+for i = 1:numel(companions)
+    q = companions(i);
+    if startsWith(q.switch_state, 'pending_') && ...
+            ~ismember(q.active_output_dim, [2, 3])
+        error('run_filter_joint_legacy_backbone:InvalidPendingOwner', ...
+            'Event %d pending transaction %g has no active formal owner.', ...
+            event_index, q.logical_id);
+    end
+    if q.output_dim > 0 && q.output_dim ~= q.active_output_dim
+        error('run_filter_joint_legacy_backbone:NonAtomicSwitch', ...
+            ['Event %d logical ID %g exposes dimension %d while committed ' ...
+             'active_output_dim is %d.'], event_index, q.logical_id, ...
+            q.output_dim, q.active_output_dim);
+    end
+end
 end
 
-function q = companion_for_external_or_pending(companions, external_id)
-q = companion_for_external(companions, external_id);
-if isempty(q), q = companion_pending_external(companions, external_id); end
+function stats = summarize_switch_transactions(records)
+stats = struct('pending_3d_to_2d_event_records', 0, ...
+    'pending_2d_to_3d_event_records', 0, ...
+    'stable_3d_event_records', 0, 'stable_2d_event_records', 0, ...
+    'hold_recovery_event_records', 0);
+for k = 1:numel(records)
+    q = records{k};
+    if isempty(q), continue; end
+    states = {q.switch_state};
+    stats.pending_3d_to_2d_event_records = ...
+        stats.pending_3d_to_2d_event_records + ...
+        nnz(strcmp(states, 'pending_3d_to_2d'));
+    stats.pending_2d_to_3d_event_records = ...
+        stats.pending_2d_to_3d_event_records + ...
+        nnz(strcmp(states, 'pending_2d_to_3d'));
+    stats.stable_3d_event_records = stats.stable_3d_event_records + ...
+        nnz(strcmp(states, 'stable_3d'));
+    stats.stable_2d_event_records = stats.stable_2d_event_records + ...
+        nnz(strcmp(states, 'stable_2d'));
+    stats.hold_recovery_event_records = ...
+        stats.hold_recovery_event_records + ...
+        nnz(strcmp(states, 'hold_recovery'));
+end
+end
+
+function log = map_manager_transition_log(raw, records, times, offset)
+template = struct('id', 0, 't_sec', NaN, 'from', '', 'to', '', 'reason', '');
+log = repmat(template, 0, 1);
+if isempty(raw) || ~isstruct(raw), return; end
+for q = 1:numel(raw)
+    item = template;
+    item.id = field_or(raw(q), 'id', 0) + offset;
+    item.t_sec = field_or(raw(q), 't_sec', NaN);
+    item.from = field_or(raw(q), 'from', '');
+    item.to = field_or(raw(q), 'to', '');
+    item.reason = field_or(raw(q), 'reason', '');
+    if isfinite(item.t_sec) && ~isempty(times)
+        [~, k] = min(abs(times - item.t_sec));
+        candidates = records{k};
+        if ~isempty(candidates)
+            i = find([candidates.local_2d_id] == field_or(raw(q), 'id', 0), 1);
+            if ~isempty(i), item.id = candidates(i).logical_id; end
+        end
+    end
+    log(end + 1, 1) = item; %#ok<AGROW>
+end
 end
 
 function q = companion_for_logical(companions, logical_id, from_2d)
 q = repmat(companion_template(), 0, 1);
 if isempty(companions) || ~isfinite(logical_id), return; end
-i = find([companions.logical_id] == logical_id & ...
+i = find([companions.local_2d_id] == logical_id & ...
     [companions.from_2d] == logical(from_2d), 1);
 if ~isempty(i), q = companions(i); end
 end
@@ -580,8 +872,11 @@ end
 function id = logical_id_for_external(external_id, companion, offset)
 id = external_id;
 if ~isempty(companion) && isfinite(companion.logical_id) && companion.logical_id > 0
-    id = companion.logical_id;
-    if companion.from_2d, id = id + offset; end
+    if companion.from_2d && isfinite(companion.local_2d_id)
+        id = companion.local_2d_id + offset;
+    else
+        id = companion.logical_id;
+    end
 end
 end
 
@@ -672,6 +967,10 @@ for i = 1:numel(out)
     s(i).angle_state = out(i).angle_state; s(i).angle_cov = out(i).angle_cov;
     s(i).state3d = out(i).state3d; s(i).cov3d = out(i).cov3d;
     s(i).status_code = out(i).status_code; s(i).quality = out(i).quality;
+    s(i).active_output_dim = out(i).active_output_dim;
+    s(i).switch_state = out(i).switch_state;
+    s(i).branch_3d_id = out(i).branch_3d_id;
+    s(i).branch_2d_id = out(i).branch_2d_id;
 end
 end
 
@@ -697,8 +996,9 @@ est = struct('X', {cell(K, 1)}, 'P', {cell(K, 1)}, 'L', {cell(K, 1)}, ...
     'N', zeros(K, 1), 'X2', {cell(K, 1)}, 'P2', {cell(K, 1)}, ...
     'L2', {cell(K, 1)}, 'N2', zeros(K, 1), 'N_total', zeros(K, 1), ...
     'logical_tracks', {cell(K, 1)}, 'output', {cell(K, 1)}, ...
+    'shadow_output', {cell(K, 1)}, 'switch_transactions', {cell(K, 1)}, ...
     'tracks', {cell(K, 1)}, 'companions', {cell(K, 1)}, ...
-    'assoc', {cell(K, 1)}, ...
+    'assoc', {cell(K, 1)}, 'measurement_disposition', {cell(K, 1)}, ...
     'filter_times', reshape([events.t_sec], [], 1), 'event_meta', events, ...
     'mode_counts', struct('n2d', zeros(K, 1), 'n3d', zeros(K, 1), ...
     'nhold', zeros(K, 1)), 'timing', struct('total', 0), ...
@@ -708,6 +1008,9 @@ end
 function o = output_template()
 o = struct('id', 0, 'birth_event', 0, 't_sec', NaN, 'mode', '', ...
     'status_code', 0, 'output_dim', 0, 'confirmed', false, 'truth_id', NaN, ...
+    'formal', true, 'logical_id', NaN, 'branch_3d_id', NaN, ...
+    'branch_2d_id', NaN, 'active_output_dim', 0, ...
+    'switch_state', '', 'shadow_for_logical_id', NaN, ...
     'last_update_t', NaN, ...
     'az_deg', NaN, 'el_deg', NaN, 'range_m', NaN, ...
     'angle_state', nan(6, 1), 'angle_cov', nan(6), ...
@@ -719,6 +1022,8 @@ end
 function s = snapshot_template()
 s = struct('id', 0, 'birth_event', 0, 'confirmed', false, 'mode', '', ...
     'status_code', 0, 'last_update_t', NaN, 'truth_id', NaN, ...
+    'active_output_dim', 0, 'switch_state', '', ...
+    'branch_3d_id', NaN, 'branch_2d_id', NaN, ...
     'quality', struct(), 'hit_history', zeros(1, 0), ...
     'angle_state', nan(6, 1), 'angle_cov', nan(6), ...
     'state3d', nan(9, 1), 'cov3d', nan(9));
@@ -728,6 +1033,10 @@ function s = companion_template()
 s = struct('external_3d_id', NaN, 'local_2d_id', NaN, ...
     'logical_id', NaN, 'previous_external_3d_id', NaN, ...
     'pending_external_3d_id', NaN, ...
+    'branch_3d_id', NaN, 'branch_2d_id', NaN, ...
+    'active_output_dim', 0, 'switch_state', 'hold_recovery', ...
+    'pending_target_branch_id', NaN, 'switch_candidate_since', NaN, ...
+    'switch_commit_t', NaN, ...
     'from_2d', false, 'confirmed', false, 'mode', '', 'output_dim', 0, ...
     'external_fresh', false, 'birth_event', 0, 'birth_t', NaN, ...
     'last_update_t', NaN, 'angle_state', nan(6, 1), ...
@@ -757,24 +1066,88 @@ function a = assoc_template()
 a = struct('id', zeros(1, 0), 'type', {cell(1, 0)}, ...
     'meas_index', zeros(1, 0), 'tid', zeros(1, 0), ...
     'ang', zeros(2, 0), 'xyz', zeros(3, 0), 'cost', zeros(1, 0), ...
-    'filter_dim', zeros(1, 0), 'innovation', zeros(3, 0), ...
+    'measurement_dim', zeros(1, 0), 'filter_dim', zeros(1, 0), ...
+    'input_dim', zeros(1, 0), 'range_updated', false(1, 0), ...
+    'innovation', zeros(3, 0), ...
     'nis', zeros(1, 0), 'group_size', zeros(1, 0), ...
     'innovation_kind', zeros(1, 0));
 end
 
 function a = append_assoc(a, id, type, mi, tid, ang, xyz, cost, filter_dim, ...
-        innovation, nis, group_size, innovation_kind)
+        innovation, nis, group_size, innovation_kind, input_dim)
 if nargin < 10 || isempty(innovation), innovation = nan(3, 1); end
 if nargin < 11 || isempty(nis), nis = NaN; end
 if nargin < 12 || isempty(group_size), group_size = 1; end
 if nargin < 13 || isempty(innovation_kind), innovation_kind = 0; end
+if nargin < 14 || isempty(input_dim), input_dim = filter_dim; end
 a.id(end + 1) = id; a.type{end + 1} = type; a.meas_index(end + 1) = mi;
 a.tid(end + 1) = tid; a.ang(:, end + 1) = ang; a.xyz(:, end + 1) = xyz;
 a.cost(end + 1) = cost; a.filter_dim(end + 1) = filter_dim;
+if strncmp(type, 'active', 6)
+    a.measurement_dim(end + 1) = 3;
+else
+    a.measurement_dim(end + 1) = 2;
+end
+a.input_dim(end + 1) = input_dim;
+a.range_updated(end + 1) = strncmp(type, 'active', 6) && filter_dim == 3;
 a.innovation(:, end + 1) = sized_innovation(innovation);
 a.nis(end + 1) = nis;
 a.group_size(end + 1) = group_size;
 a.innovation_kind(end + 1) = innovation_kind;
+end
+
+function disposition = build_measurement_disposition(a, event, event_index)
+active_suppressed = true(1, event.active.n_meas);
+passive_suppressed = true(1, event.passive.n_meas);
+for q = 1:numel(a.id)
+    mi = a.meas_index(q);
+    if ~isfinite(mi) || mi ~= round(mi), continue; end
+    if strncmp(a.type{q}, 'active', 6) && mi >= 1 && mi <= numel(active_suppressed)
+        active_suppressed(mi) = false;
+    elseif strncmp(a.type{q}, 'passive', 7) && mi >= 1 && mi <= numel(passive_suppressed)
+        passive_suppressed(mi) = false;
+    end
+end
+disposition = struct( ...
+    'active', joint_measurement_disposition(event.active.n_meas, a, ...
+        'active', active_suppressed, event_index), ...
+    'passive', joint_measurement_disposition(event.passive.n_meas, a, ...
+        'passive', passive_suppressed, event_index));
+end
+
+function stats = summarize_measurement_disposition(records)
+stats = struct('active_measurements', 0, 'passive_measurements', 0, ...
+    'active_assigned', 0, 'passive_assigned', 0, ...
+    'active_births', 0, 'passive_births', 0, ...
+    'active_birth_suppressed', 0, 'passive_birth_suppressed', 0, ...
+    'active_unaccounted', 0, 'passive_unaccounted', 0, ...
+    'active_range_measurements', 0, 'active_range_updates', 0, ...
+    'active_range_births', 0, 'active_range_birth_suppressed', 0, ...
+    'active_range_unaccounted', 0, ...
+    'passive_to_2d', 0, 'passive_to_3d', 0, 'passive_not_routed', 0);
+for k = 1:numel(records)
+    if isempty(records{k}), continue; end
+    active = records{k}.active;
+    passive = records{k}.passive;
+    stats.active_measurements = stats.active_measurements + numel(active.action);
+    stats.passive_measurements = stats.passive_measurements + numel(passive.action);
+    stats.active_assigned = stats.active_assigned + nnz(active.action == 1);
+    stats.active_births = stats.active_births + nnz(active.action == 2);
+    stats.active_birth_suppressed = stats.active_birth_suppressed + nnz(active.action == 3);
+    stats.passive_assigned = stats.passive_assigned + nnz(passive.action == 1);
+    stats.passive_births = stats.passive_births + nnz(passive.action == 2);
+    stats.passive_birth_suppressed = stats.passive_birth_suppressed + nnz(passive.action == 3);
+    stats.active_unaccounted = stats.active_unaccounted + nnz(active.action == 0);
+    stats.passive_unaccounted = stats.passive_unaccounted + nnz(passive.action == 0);
+    stats.passive_to_2d = stats.passive_to_2d + nnz(passive.input_dim == 2);
+    stats.passive_to_3d = stats.passive_to_3d + nnz(passive.input_dim == 3);
+    stats.passive_not_routed = stats.passive_not_routed + nnz(passive.input_dim == 0);
+end
+stats.active_range_measurements = stats.active_measurements;
+stats.active_range_updates = stats.active_assigned + stats.active_births;
+stats.active_range_births = stats.active_births;
+stats.active_range_birth_suppressed = stats.active_birth_suppressed;
+stats.active_range_unaccounted = stats.active_unaccounted;
 end
 
 function [innovation, nis, group_size, innovation_kind] = assoc_diagnostic(s, q)

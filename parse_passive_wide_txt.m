@@ -28,7 +28,6 @@ fid = fopen(filepath, 'r');
 if fid < 0, error('无法打开文件: %s', filepath); end
 
 total_data_rows = 0;
-previous_row_time = NaN; day_offset = 0;
 while ~feof(fid)
     line = fgetl(fid);
     if ~ischar(line), break; end
@@ -37,8 +36,6 @@ while ~feof(fid)
     parts = split_line_auto(line, cfg);
     if is_passive_data_row(parts, c)
         t_row = parse_time_str(strtrim(parts{c.time_col}), c.time_format);
-        [t_row, previous_row_time, day_offset] = unwrap_fusion_clock_sample( ...
-            t_row, previous_row_time, day_offset, c.time_format);
         if within_time_range(t_row, cfg)
             total_data_rows = total_data_rows + 1;
         end
@@ -67,8 +64,6 @@ n_meas = 0;
 row_count = 0;
 n_skip_invalid = 0;
 n_skip_missing = 0;
-n_truncated_targets = 0;
-previous_row_time = NaN; day_offset = 0;
 
 while ~feof(fid)
     line = fgetl(fid);
@@ -82,8 +77,6 @@ while ~feof(fid)
     end
 
     t_row = parse_time_str(strtrim(parts{c.time_col}), c.time_format);
-    [t_row, previous_row_time, day_offset] = unwrap_fusion_clock_sample( ...
-        t_row, previous_row_time, day_offset, c.time_format);
     if isnan(t_row), continue; end
 
     if ~within_time_range(t_row, cfg)
@@ -94,12 +87,8 @@ while ~feof(fid)
     if row_count > last_read_row, break; end
 
     n_targets = str2double(strtrim(parts{c.count_col}));
-    if ~isfinite(n_targets) || n_targets <= 0, continue; end
-    n_targets = floor(n_targets);
-    if n_targets > max_targets
-        n_truncated_targets = n_truncated_targets + n_targets - max_targets;
-        n_targets = max_targets;
-    end
+    if isnan(n_targets) || n_targets <= 0, continue; end
+    n_targets = min(floor(n_targets), max_targets);
 
     for g = 1:n_targets
         off = (g - 1) * c.stride;
@@ -133,15 +122,13 @@ while ~feof(fid)
         az_v = str2double(strtrim(parts{col_az}));
         el_v = str2double(strtrim(parts{col_el}));
 
-        az_out = az_v * ang_scale;
-        el_out = el_v * ang_scale;
-        if any(~isfinite([az_out, el_out])) || abs(el_out) > 90
+        if any(isnan([az_v, el_v]))
             n_skip_missing = n_skip_missing + 1;
             continue;
         end
 
         tid_v = str2double(strtrim(parts{col_tid}));
-        if ~isfinite(tid_v), tid_v = NaN; end
+        if isnan(tid_v), tid_v = NaN; end
 
         n_meas = n_meas + 1;
         if n_meas > numel(t_sec)
@@ -149,8 +136,8 @@ while ~feof(fid)
                 t_sec, az_deg, el_deg, target_id);
         end
         t_sec(n_meas)     = t_row;
-        az_deg(n_meas)    = az_out;
-        el_deg(n_meas)    = el_out;
+        az_deg(n_meas)    = az_v * ang_scale;
+        el_deg(n_meas)    = el_v * ang_scale;
         target_id(n_meas) = tid_v;
     end
 end
@@ -175,15 +162,9 @@ passive_data.el_deg    = el_deg;
 passive_data.target_id = target_id;
 passive_data.source    = [fname, ext];
 passive_data.n_meas    = n_meas;
-passive_data.n_truncated_targets = n_truncated_targets;
 
-fprintf('  有效量测=%d, 跳过(无效=%d,缺失=%d), 上限截断=%d\n', ...
-    n_meas, n_skip_invalid, n_skip_missing, n_truncated_targets);
-if n_truncated_targets > 0
-    warning('parse_passive_wide_txt:TargetLimitExceeded', ...
-        '%s 有 %d 个目标块超过 max_targets_per_row=%d 并被截断。', ...
-        filepath, n_truncated_targets, max_targets);
-end
+fprintf('  有效量测=%d, 跳过(无效=%d,缺失=%d)\n', ...
+    n_meas, n_skip_invalid, n_skip_missing);
 if n_meas > 0
     fprintf('  时间: %.3f ~ %.3f s, az: %.1f~%.1f deg, el: %.1f~%.1f deg\n', ...
         min(t_sec), max(t_sec), min(az_deg), max(az_deg), min(el_deg), max(el_deg));
@@ -193,7 +174,29 @@ end
 
 %% ═══════════════════════════════════════════════════════════════════════════
 function t_sec = parse_time_str(t_str, fmt)
-t_sec = parse_fusion_time(t_str, fmt);
+t_str = strtrim(char(t_str));
+t_str = strrep(t_str, char(65279), '');
+if isempty(t_str)
+    t_sec = NaN; return;
+end
+t_num = str2double(t_str);
+if ~isnan(t_num)
+    t_sec = t_num; return;
+end
+switch lower(fmt)
+    case 'hms'
+        t_sec = hms_to_seconds(t_str);
+    otherwise
+        t_sec = str2double(t_str);
+end
+end
+
+function sec = hms_to_seconds(t_str)
+parts = strsplit(strtrim(t_str), ':');
+if numel(parts) < 3, sec = NaN; return; end
+h = str2double(parts{1}); m = str2double(parts{2}); s = str2double(parts{3});
+if any(isnan([h, m, s])), sec = NaN; return; end
+sec = h * 3600 + m * 60 + s;
 end
 
 %% ═══════════════════════════════════════════════════════════════════════════
@@ -204,11 +207,11 @@ if isfield(cfg, 'delimiter') && ~isempty(cfg.delimiter)
 end
 
 if ischar(delimiter) && strcmpi(delimiter, 'auto')
-    if contains(line, ',')
+    if ~isempty(strfind(line, ','))
         parts = strsplit(line, ',', 'CollapseDelimiters', false);
-    elseif contains(line, sprintf('\t'))
+    elseif ~isempty(strfind(line, sprintf('\t')))
         parts = strsplit(line, sprintf('\t'), 'CollapseDelimiters', false);
-    elseif contains(line, ';')
+    elseif ~isempty(strfind(line, ';'))
         parts = strsplit(line, ';', 'CollapseDelimiters', false);
     else
         parts = regexp(strtrim(line), '\s+', 'split');
@@ -251,7 +254,8 @@ end
 end
 
 %% ═══════════════════════════════════════════════════════════════════════════
-function [t_sec, az_deg, el_deg, target_id] = grow_arrays(t_sec, az_deg, el_deg, target_id)
+function [t_sec, az_deg, el_deg, target_id] = grow_arrays( ...
+        t_sec, az_deg, el_deg, target_id)
 grow_by = max(1024, numel(t_sec));
 t_sec     = [t_sec;     zeros(grow_by, 1)];
 az_deg    = [az_deg;    zeros(grow_by, 1)];

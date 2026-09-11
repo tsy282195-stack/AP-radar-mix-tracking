@@ -29,7 +29,6 @@ fid = fopen(filepath, 'r');
 if fid < 0, error('无法打开文件: %s', filepath); end
 
 total_data_rows = 0;
-previous_row_time = NaN; day_offset = 0;
 while ~feof(fid)
     line = fgetl(fid);
     if ~ischar(line), break; end
@@ -38,8 +37,6 @@ while ~feof(fid)
     parts = split_line_auto(line, cfg);
     if is_active_data_row(parts, c)
         t_row = parse_time_str(strtrim(parts{c.time_col}), c.time_format);
-        [t_row, previous_row_time, day_offset] = unwrap_fusion_clock_sample( ...
-            t_row, previous_row_time, day_offset, c.time_format);
         if within_time_range(t_row, cfg)
             total_data_rows = total_data_rows + 1;
         end
@@ -72,8 +69,6 @@ row_count = 0;
 n_skip_invalid = 0;
 n_skip_missing = 0;
 n_ae_only      = 0;
-n_truncated_targets = 0;
-previous_row_time = NaN; day_offset = 0;
 
 while ~feof(fid)
     line = fgetl(fid);
@@ -88,8 +83,6 @@ while ~feof(fid)
 
     % 解析时间
     t_row = parse_time_str(strtrim(parts{c.time_col}), c.time_format);
-    [t_row, previous_row_time, day_offset] = unwrap_fusion_clock_sample( ...
-        t_row, previous_row_time, day_offset, c.time_format);
     if isnan(t_row), continue; end
 
     if ~within_time_range(t_row, cfg)
@@ -101,12 +94,8 @@ while ~feof(fid)
 
     % 目标数量
     n_targets = str2double(strtrim(parts{c.count_col}));
-    if ~isfinite(n_targets) || n_targets <= 0, continue; end
-    n_targets = floor(n_targets);
-    if n_targets > max_targets
-        n_truncated_targets = n_truncated_targets + n_targets - max_targets;
-        n_targets = max_targets;
-    end
+    if isnan(n_targets) || n_targets <= 0, continue; end
+    n_targets = min(floor(n_targets), max_targets);
 
     % 遍历每个目标块
     for g = 1:n_targets
@@ -143,9 +132,7 @@ while ~feof(fid)
         el_v = str2double(strtrim(parts{col_el}));
         r_v  = str2double(strtrim(parts{col_range}));
 
-        az_out = az_v * ang_scale;
-        el_out = el_v * ang_scale;
-        if any(~isfinite([az_out, el_out])) || abs(el_out) > 90
+        if any(isnan([az_v, el_v]))
             n_skip_missing = n_skip_missing + 1;
             continue;
         end
@@ -157,7 +144,7 @@ while ~feof(fid)
 
         % 读取目标编号
         tid_v = str2double(strtrim(parts{col_tid}));
-        if ~isfinite(tid_v), tid_v = NaN; end
+        if isnan(tid_v), tid_v = NaN; end
 
         n_meas = n_meas + 1;
         if n_meas > numel(t_sec)
@@ -165,8 +152,8 @@ while ~feof(fid)
                 t_sec, az_deg, el_deg, range_m, range_valid, target_id);
         end
         t_sec(n_meas)    = t_row;
-        az_deg(n_meas)   = az_out;
-        el_deg(n_meas)   = el_out;
+        az_deg(n_meas)   = az_v * ang_scale;
+        el_deg(n_meas)   = el_v * ang_scale;
         range_m(n_meas)  = r_v;
         range_valid(n_meas) = range_ok;
         target_id(n_meas) = tid_v;
@@ -200,15 +187,9 @@ active_data.range_valid = range_valid;
 active_data.target_id = target_id;
 active_data.source    = [fname, ext];
 active_data.n_meas    = n_meas;
-active_data.n_truncated_targets = n_truncated_targets;
 
-fprintf('  有效AE量测=%d (完整RAE=%d, AE-only=%d), 跳过(无效=%d,缺失=%d), 上限截断=%d\n', ...
-    n_meas, nnz(range_valid), n_ae_only, n_skip_invalid, n_skip_missing, n_truncated_targets);
-if n_truncated_targets > 0
-    warning('parse_active_wide_txt:TargetLimitExceeded', ...
-        '%s 有 %d 个目标块超过 max_targets_per_row=%d 并被截断。', ...
-        filepath, n_truncated_targets, max_targets);
-end
+fprintf('  有效AE量测=%d (完整RAE=%d, AE-only=%d), 跳过(无效=%d,缺失=%d)\n', ...
+    n_meas, nnz(range_valid), n_ae_only, n_skip_invalid, n_skip_missing);
 if n_meas > 0
     rv = range_m(range_valid & isfinite(range_m));
     if isempty(rv)
@@ -223,7 +204,46 @@ end
 
 %% ═══════════════════════════════════════════════════════════════════════════
 function t_sec = parse_time_str(t_str, fmt)
-t_sec = parse_fusion_time(t_str, fmt);
+% 解析时间字符串/数值 → 秒数
+t_str = strtrim(char(t_str));
+t_str = strrep(t_str, char(65279), '');
+if isempty(t_str)
+    t_sec = NaN;
+    return;
+end
+
+% 尝试直接转为数值（已经是秒数的情况）
+t_num = str2double(t_str);
+if ~isnan(t_num)
+    t_sec = t_num;
+    return;
+end
+
+% 尝试 hh:mm:ss.sss 格式
+switch lower(fmt)
+    case 'hms'
+        t_sec = hms_to_seconds(t_str);
+    otherwise
+        t_sec = str2double(t_str);
+end
+end
+
+%% ═══════════════════════════════════════════════════════════════════════════
+function sec = hms_to_seconds(t_str)
+% 将 hh:mm:ss.sss 字符串转为从当日零时起的秒数
+parts = strsplit(strtrim(t_str), ':');
+if numel(parts) < 3
+    sec = NaN;
+    return;
+end
+h = str2double(parts{1});
+m = str2double(parts{2});
+s = str2double(parts{3});
+if any(isnan([h, m, s]))
+    sec = NaN;
+    return;
+end
+sec = h * 3600 + m * 60 + s;
 end
 
 %% ═══════════════════════════════════════════════════════════════════════════
@@ -235,11 +255,11 @@ if isfield(cfg, 'delimiter') && ~isempty(cfg.delimiter)
 end
 
 if ischar(delimiter) && strcmpi(delimiter, 'auto')
-    if contains(line, ',')
+    if ~isempty(strfind(line, ','))
         parts = strsplit(line, ',', 'CollapseDelimiters', false);
-    elseif contains(line, sprintf('\t'))
+    elseif ~isempty(strfind(line, sprintf('\t')))
         parts = strsplit(line, sprintf('\t'), 'CollapseDelimiters', false);
-    elseif contains(line, ';')
+    elseif ~isempty(strfind(line, ';'))
         parts = strsplit(line, ';', 'CollapseDelimiters', false);
     else
         parts = regexp(strtrim(line), '\s+', 'split');

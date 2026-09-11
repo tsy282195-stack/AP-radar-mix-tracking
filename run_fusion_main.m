@@ -1,4 +1,4 @@
-%% run_fusion_main.m
+  %% run_fusion_main.m
 % 主被动雷达融合跟踪系统 - 主入口脚本
 %
 % 流程:
@@ -11,7 +11,7 @@
 
 clear; close all;
 fprintf('╔════════════════════════════════════════════════════╗\n');
-fprintf('║   主被动异构融合跟踪系统  - IMM-KF/CKF滤波        ║\n');
+fprintf('║   主被动雷达融合跟踪系统  - 自适应CKF滤波         ║\n');
 fprintf('╚════════════════════════════════════════════════════╝\n\n');
 
 %% ── 第1步：加载配置 ───────────────────────────────────────────────────
@@ -30,16 +30,18 @@ fprintf('\n========== 数据解析 ==========\n');
 
 [active_list, passive_list, load_info] = load_radar_measurement_files(cfg);
 fprintf('  文件解析模式: %s, 耗时 %.2f s\n', load_info.mode, load_info.elapsed_s);
+if load_info.cache_enabled
+    fprintf('  解析缓存: 命中=%d, 未命中=%d, 写入=%d\n', ...
+        load_info.cache_hits, load_info.cache_misses, load_info.cache_writes);
+end
 
-% Platform interpolation must cover the selected radar interval. Percentage
-% windows are meaningful for radar rows, not for an independently sampled
-% navigation file, so always load the complete platform timeline here.
+% Platform support data must cover the selected radar interval. Applying the
+% radar row percentage to a differently sampled platform file can truncate it.
 platform_cfg = cfg;
 platform_cfg.read_start_percent = 0;
 platform_cfg.read_end_percent = 100;
 platform_cfg.read_percent = 100;
 platform_cfg.max_rows = inf;
-platform_cfg.time_range_s = [];
 platform = load_platform_txt( ...
     resolve_data_path(cfg.data_dir, cfg.platform_file), platform_cfg);
 assert_platform_covers_measurements(platform, active_list, passive_list);
@@ -58,13 +60,8 @@ fprintf('\n========== 滤波输入构造 ==========\n');
 fprintf('\n========== 异步异构量测事件输入 ==========\n');
 joint_events = [];
 if strcmp(cfg.processing_framework, 'joint_2d3d')
-    [joint_events, fusion_info, legacy_input] = build_joint_measurement_events(frames, cfg);
-    fused_xyz = legacy_input.xyz;
-    fused_R = legacy_input.R;
-    fused_ids = legacy_input.ids;
-    passive_bearing = legacy_input.passive_bearing;
-    frame_times = legacy_input.times;
-    event_meta = legacy_input.event_meta;
+    [fused_xyz, fused_R, fusion_info, passive_bearing, fused_ids, frame_times, event_meta] = ...
+        build_async_measurement_events(frames, cfg);
 else
     if isempty(active_list)
         error('legacy_active3d 框架不支持主动量测为空，请改用 joint_2d3d。');
@@ -72,32 +69,28 @@ else
     [fused_xyz, fused_R, fusion_info, passive_bearing, fused_ids, frame_times, event_meta] = ...
         build_async_measurement_events(frames, cfg);
 end
-fusion_info.preprocessing = coherence_info;
+if isempty(frame_times)
+    fprintf(['无可用滤波事件，流程结束。请检查量测有效性以及' ...
+        'passive_bearing_enabled等输入开关。\n']);
+    return;
+end
 
-%% ── 第5步：统一IMM-KF/CKF滤波 ─────────────────────────────────────────
-fprintf('\n========== 统一IMM-KF/CKF滤波 ==========\n');
+%% ── 第5步：自适应CKF滤波 ──────────────────────────────────────────────
+fprintf('\n========== 自适应CKF滤波 ==========\n');
 tic;
 if strcmp(cfg.processing_framework, 'joint_2d3d')
-    est = run_filter_joint_2d3d(joint_events, platform, cfg);
-    n_active_accounted = coherence_info.n_active_condensed + ...
-        fusion_info.n_active_duplicates + est.stats.active_measurements;
-    n_passive_accounted = fusion_info.n_passive_duplicates + est.stats.passive_measurements;
-    if n_active_accounted ~= coherence_info.n_active_input || ...
-            n_passive_accounted ~= coherence_info.n_passive_input
-        error('run_fusion_main:InputAccountingMismatch', ...
-            '原始量测至滤波输入的凝聚/去重计数不守恒。');
-    end
-    fprintf(['  [主动输入去向] 原始=%d = 凝聚归并%d + 跨文件去重%d + ' ...
-        '关联%d + 新生%d + 明确抑制%d\n'], ...
-        coherence_info.n_active_input, coherence_info.n_active_condensed, ...
-        fusion_info.n_active_duplicates, est.stats.active_assigned, ...
-        est.stats.active_births, est.stats.active_birth_suppressed);
-    fprintf(['  [被动输入去向] 原始=%d = 跨文件去重%d + ' ...
-        '关联%d + 新生%d + 明确抑制%d\n'], ...
-        coherence_info.n_passive_input, fusion_info.n_passive_duplicates, ...
-        est.stats.passive_assigned, est.stats.passive_births, ...
-        est.stats.passive_birth_suppressed);
-    fprintf('  逐量测去向: est.measurement_disposition，索引与joint_events内量测一一对应。\n');
+    [est, joint_events] = run_filter_joint_legacy_backbone( ...
+        fused_xyz, fused_R, frame_times, passive_bearing, platform, ...
+        fused_ids, event_meta, cfg, joint_events);
+    fusion_info.n_angle_filter = sum(arrayfun(@(e) e.passive.n_meas, joint_events));
+    fusion_info.n_angle_shard_duplicates = est.stats.angle_shard_duplicates;
+    fusion_info.n_angle_shard_duplicates_passive = ...
+        est.stats.angle_shard_duplicates_passive;
+    fusion_info.n_angle_shard_duplicates_active = ...
+        est.stats.angle_shard_duplicates_active;
+    input_accounting = assert_joint_input_conservation(coherence_info, est, cfg);
+    est.input_accounting = input_accounting;
+    fusion_info.input_accounting = input_accounting;
 else
     est = run_filter_adapt_ckf(fused_xyz, fused_R, frame_times, cfg, ...
         passive_bearing, platform, fused_ids, event_meta);
@@ -105,11 +98,9 @@ end
 elapsed = toc;
 fprintf('总耗时: %.2f s\n', elapsed);
 
-%% ── 第6步：定量评价指 标 ───────────────────────────────────────────────
+%% ── 第6步：定量评价指标 ───────────────────────────────────────────────
 metrics_info = [];
 if ~isfield(cfg, 'metrics_enabled') || cfg.metrics_enabled
-    fprintf('\n========== 定量评价 ==========\n');
-    metrics_start = tic;
     try
         if strcmp(cfg.processing_framework, 'joint_2d3d')
             metrics_info = evaluate_joint_tracking_metrics(est, joint_events, cfg, platform);
@@ -118,17 +109,15 @@ if ~isfield(cfg, 'metrics_enabled') || cfg.metrics_enabled
                 est, frame_times, cfg);
         end
     catch ME
-        error('run_fusion_main:MetricsFailed', ...
-            '定量评价指标计算失败，已停止保存正式结果: %s', ME.message);
+        warning('定量评价指标计算失败: %s', ME.message);
     end
-    fprintf('定量评价耗时: %.2f s\n', toc(metrics_start));
 end
 
 if cfg.do_plot
     fprintf('\n========== 可视化 ==========\n');
 
     if strcmp(cfg.processing_framework, 'joint_2d3d')
-        plot_joint_tracking_results(est, joint_events, cfg);
+        plot_joint_tracking_results(est, joint_events, cfg, frames);
     else
 
     % ── 收集全部主动量测点 ──
@@ -150,12 +139,12 @@ if cfg.do_plot
                 pos = est.X{k}([1,4,7], i);
                 idx = find(track_labels == tid, 1);
                 if isempty(idx)
-                    track_labels(end+1) = tid;          %#ok<SAGROW>
-                    track_pos{end+1} = pos;             %#ok<SAGROW>
-                    track_t{end+1}   = frame_times(k);  %#ok<SAGROW>
+                    track_labels(end+1) = tid;          %#ok<AGROW>
+                    track_pos{end+1} = pos;             %#ok<AGROW>
+                    track_t{end+1}   = frame_times(k);  %#ok<AGROW>
                 else
-                    track_pos{idx} = [track_pos{idx}, pos]; %#ok<SAGROW>
-                    track_t{idx}   = [track_t{idx}, frame_times(k)]; %#ok<SAGROW>
+                    track_pos{idx} = [track_pos{idx}, pos];
+                    track_t{idx}   = [track_t{idx},   frame_times(k)];
                 end
             end
         end
@@ -197,12 +186,8 @@ if cfg.do_plot
                          '.-', 'Color', col, 'LineWidth', 0.6, 'MarkerSize', 3);
         plot3(pos_seq(1, 1), pos_seq(2, 1), pos_seq(3, 1), ...
               'o', 'Color', col, 'MarkerFaceColor', col, 'MarkerSize', 4);
-        % 在轨迹起点附近标上目标编号
-        text(pos_seq(1, 1), pos_seq(2, 1), pos_seq(3, 1), ...
-             sprintf(' est%d', track_labels(idx)), ...
-             'Color', col, 'FontSize', 8, 'FontWeight', 'bold', ...
-             'VerticalAlignment', 'bottom');
-        leg_str{t} = sprintf('est%d', track_labels(idx));
+        annotate_track_start(gca, pos_seq, track_labels(idx), col);
+        leg_str{t} = sprintf('Track %d', track_labels(idx));
     end
     if n_tracks > 0
         legend(h_leg, leg_str, 'Location', 'bestoutside');
@@ -231,12 +216,8 @@ if cfg.do_plot
                          '.-', 'Color', col, 'LineWidth', 0.6, 'MarkerSize', 3);
         plot(pos_seq(1, 1), pos_seq(2, 1), ...
              'o', 'Color', col, 'MarkerFaceColor', col, 'MarkerSize', 4);
-        % 在轨迹起点附近标上目标编号
-        text(pos_seq(1, 1), pos_seq(2, 1), ...
-             sprintf(' est%d', track_labels(idx)), ...
-             'Color', col, 'FontSize', 8, 'FontWeight', 'bold', ...
-             'VerticalAlignment', 'bottom');
-        leg_str2{t} = sprintf('est%d', track_labels(idx));
+        annotate_track_start(gca, pos_seq(1:2, :), track_labels(idx), col);
+        leg_str2{t} = sprintf('Track %d', track_labels(idx));
     end
     if n_tracks > 0
         legend(h_leg2, leg_str2, 'Location', 'bestoutside');
@@ -300,11 +281,8 @@ if cfg.do_plot
         end
 
         set(gca, 'XTick', 1:ntot, 'XTickLabel', ...
-            arrayfun(@(g) sprintf('est%d', g), lab_sorted, 'UniformOutput', false));
-        try
-            xtickangle(45);
-        catch
-        end
+            arrayfun(@(g) sprintf('Track %d', g), lab_sorted, 'UniformOutput', false));
+        try, xtickangle(45); catch, end
         xlim([0.5, ntot + 0.5]);
         xlabel('航迹编号'); ylabel('航迹长度 (帧)');
         title(sprintf('估计航迹长度 (共%d条, \\geq%d帧: %d条%s)', ...
@@ -346,8 +324,7 @@ if isfield(cfg, 'do_smoothing') && cfg.do_smoothing && ...
             plot_track_smoothing(smt, po);
         end
     catch ME
-        warning('run_fusion_main:SmoothingFailed', ...
-            '二次平滑失败: %s', ME.message);
+        warning('二次平滑失败: %s', ME.message);
     end
 end
 
@@ -356,10 +333,21 @@ fprintf('\n╔══════════════════════
 fprintf('║                    结果汇总                        ║\n');
 fprintf('╠════════════════════════════════════════════════════╣\n');
 fprintf('║  总帧数:          %6d                          ║\n', numel(frames));
-fprintf('║  主动量测总数:    %6d                          ║\n', fusion_info.n_active);
-fprintf('║  被动量测总数:    %6d                          ║\n', fusion_info.n_passive);
+fprintf('║  主动RAE量测:     %6d                          ║\n', fusion_info.n_active);
+fprintf('║  物理被动AE量测:  %6d                          ║\n', fusion_info.n_passive);
 fprintf('║  异步事件总数:    %6d                          ║\n', fusion_info.n_events);
-fprintf('║  被动bearing量测: %6d                          ║\n', fusion_info.n_passive_bearing);
+if isfield(fusion_info, 'n_active_ae_only') && fusion_info.n_active_ae_only > 0
+    fprintf('║  主动AE-only量测: %6d                          ║\n', fusion_info.n_active_ae_only);
+end
+if isfield(fusion_info, 'n_bearing_only_total')
+    fprintf('║  独立AE量测合计:  %6d                          ║\n', ...
+        fusion_info.n_bearing_only_total);
+end
+if isfield(fusion_info, 'n_angle_shard_duplicates') && ...
+        fusion_info.n_angle_shard_duplicates > 0
+    fprintf('║  角度重叠行删除:   %6d                          ║\n', ...
+        fusion_info.n_angle_shard_duplicates);
+end
 if isfield(est, 'N_total')
     fprintf('║  逻辑航迹输出数:  %6d (跨所有事件)            ║\n', sum(est.N_total));
     fprintf('║  二维/三维输出:   %6d / %-6d                  ║\n', sum(est.N2), sum(est.N));
@@ -371,30 +359,6 @@ fprintf('╚══════════════════════�
 
 if exist('metrics_info', 'var') && ~isempty(metrics_info) && isstruct(metrics_info)
     fprintf('\n定量评价指标汇总:\n');
-    if isfield(metrics_info, 'real_truth')
-        R = metrics_info.real_truth;
-        if strcmp(get_struct_field(R, 'status', ''), 'ok')
-            fprintf(['  [真实精度] 目标=%d, 输出时间匹配=%d/%d, ', ...
-                '目标覆盖=%d/%d\n'], R.n_truth_targets, ...
-                R.n_time_matched_outputs, R.n_identity_mapped_outputs, ...
-                R.n_output_truth_targets, R.n_truth_targets);
-            if R.three_d.position.n > 0
-                fprintf('             三维位置RMSE: E/N/U=[%.2f %.2f %.2f]m, 3D=%.2fm (%d点)\n', ...
-                    R.three_d.position.rmse_e_m, R.three_d.position.rmse_n_m, ...
-                    R.three_d.position.rmse_u_m, R.three_d.position.rmse_3d_m, ...
-                    R.three_d.position.n);
-            end
-            if R.two_d.angle.n > 0
-                fprintf('             二维角度RMSE: az=%.4fdeg, el=%.4fdeg, LOS=%.4fdeg (%d点)\n', ...
-                    R.two_d.angle.rmse_az_deg, R.two_d.angle.rmse_el_deg, ...
-                    R.two_d.angle.rmse_los_deg, R.two_d.angle.n);
-            end
-        else
-            fprintf('  [真实精度] 不可用: %s (%s)\n', ...
-                get_struct_field(R, 'status', 'unavailable'), ...
-                get_struct_field(R, 'reason', 'truth_not_available'));
-        end
-    end
     if isfield(metrics_info, 'truth_targets')
         truth_count = metrics_info.truth_targets;
     elseif isfield(metrics_info, 'id_split')
@@ -404,31 +368,39 @@ if exist('metrics_info', 'var') && ~isempty(metrics_info) && isstruct(metrics_in
     end
     if ~isempty(truth_count) && isfield(truth_count, 'raw_id_count') && ...
             isfield(truth_count, 'instance_count')
-        fprintf('  [量测伪真值一致性] 原始标签=%d, 拆分后=%d, 被拆分原始编号=%d\n', ...
-            truth_count.raw_id_count, truth_count.instance_count, ...
-            get_struct_field(truth_count, 'n_split_raw_ids', 0));
+        active_targets = get_struct_field(truth_count, ...
+            'n_active_raw_targets', truth_count.raw_id_count);
+        active_instances = get_struct_field(truth_count, ...
+            'n_active_split_instances', truth_count.instance_count);
+        passive_targets = get_struct_field(truth_count, ...
+            'n_passive_raw_targets', 0);
+        fprintf(['  [真值] 主动目标=%d, 主动拆分实例=%d, ' ...
+            '被动目标数据=%d\n'], active_targets, active_instances, ...
+            passive_targets);
     end
     if isfield(metrics_info, 'two_d') && isfield(metrics_info, 'three_d') && ...
             isfield(metrics_info, 'overall')
         D2 = metrics_info.two_d;
         D3 = metrics_info.three_d;
         OA = metrics_info.overall;
-        fprintf(['  [二维] 输出=%d点/%d轨, 量测关联率=%.2f%%, 关联点一致率=%.2f%%, ', ...
-            '航迹正确率=%.2f%%\n'], D2.output.n_outputs, D2.output.n_unique_tracks, ...
-            100 * D2.association.rate_all_tracks, 100 * D2.accuracy.accuracy, ...
-            100 * D2.track_accuracy.accuracy_vs_output);
-        if D2.angle.n > 0
-            fprintf('         角度RMSE: az=%.4fdeg, el=%.4fdeg, LOS=%.4fdeg (%d点)\n', ...
-                D2.angle.rmse_az_deg, D2.angle.rmse_el_deg, ...
-                D2.angle.rmse_los_deg, D2.angle.n);
+        if isfield(D2, 'applicable') && ~D2.applicable
+            fprintf('  [二维] 不适用：纯二维真值=0条，独立二维输出=%d条\n', ...
+                D2.output.n_unique_tracks);
+        else
+            fprintf(['  [二维] 输出=%d点/%d轨, 量测关联率=%.2f%%, 关联点一致率=%.2f%%, ', ...
+                '航迹正确率=%.2f%%\n'], D2.output.n_outputs, D2.output.n_unique_tracks, ...
+                100 * D2.association.rate_all_tracks, 100 * D2.accuracy.accuracy, ...
+                100 * D2.track_accuracy.accuracy_vs_output);
+            if D2.angle.n > 0
+                fprintf('         角度RMSE: az=%.4fdeg, el=%.4fdeg, LOS=%.4fdeg (%d点)\n', ...
+                    D2.angle.rmse_az_deg, D2.angle.rmse_el_deg, ...
+                    D2.angle.rmse_los_deg, D2.angle.n);
+            end
+            fprintf('         起始延迟: 最早=%.3fs, 主航迹=%.3fs (%d/%d目标)\n', ...
+                D2.start_time.mean_track_start_delay_s, ...
+                D2.start_time.mean_main_track_start_delay_s, ...
+                D2.start_time.n_started, D2.start_time.n_truth);
         end
-        fprintf('         起始延迟: 最早=%.3fs, 主航迹=%.3fs (%d/%d目标)\n', ...
-            D2.start_time.mean_track_start_delay_s, ...
-            D2.start_time.mean_main_track_start_delay_s, ...
-            D2.start_time.n_started, D2.start_time.n_truth);
-        fprintf('         正式输出同步覆盖率=%.2f%% (%d/%d带标签物理量测点)\n', ...
-            100 * D2.output_coverage.rate, D2.output_coverage.n_covered_measurements, ...
-            D2.output_coverage.n_reference_measurements);
 
         fprintf(['  [三维] 输出=%d点/%d轨, 量测关联率=%.2f%%, 关联点一致率=%.2f%%, ', ...
             '航迹正确率=%.2f%%\n'], D3.output.n_outputs, D3.output.n_unique_tracks, ...
@@ -443,9 +415,6 @@ if exist('metrics_info', 'var') && ~isempty(metrics_info) && isstruct(metrics_in
             D3.start_time.mean_track_start_delay_s, ...
             D3.start_time.mean_main_track_start_delay_s, ...
             D3.start_time.n_started, D3.start_time.n_truth);
-        fprintf('         正式输出同步覆盖率=%.2f%% (%d/%d带标签物理量测点)\n', ...
-            100 * D3.output_coverage.rate, D3.output_coverage.n_covered_measurements, ...
-            D3.output_coverage.n_reference_measurements);
 
         fprintf(['  [总体] 输出=%d点/%d轨, 关联率(全部/曾确认)=%.2f%%/%.2f%%, ', ...
             '关联点一致率=%.2f%%, 航迹正确率=%.2f%%\n'], ...
@@ -454,16 +423,6 @@ if exist('metrics_info', 'var') && ~isempty(metrics_info) && isstruct(metrics_in
             100 * OA.association.rate_confirmed_tracks, ...
             100 * OA.accuracy.accuracy, ...
             100 * OA.track_accuracy.accuracy_vs_output);
-        fprintf('         正式输出同步覆盖率=%.2f%% (%d/%d带标签物理量测点)\n', ...
-            100 * OA.output_coverage.rate, OA.output_coverage.n_covered_measurements, ...
-            OA.output_coverage.n_reference_measurements);
-        if isfield(metrics_info, 'measurement_accounting') && ...
-                isfield(metrics_info.measurement_accounting, 'passive')
-            P = metrics_info.measurement_accounting.passive;
-            fprintf(['  [物理被动量测] 输入=%d, 去2D=%d, 去3D=%d, 关联后未保留=%d, ' ...
-                '明确抑制=%d, 未解释=%d\n'], P.n_input, P.n_to_2d, P.n_to_3d, ...
-                P.n_associated_not_retained, P.n_explicitly_suppressed, P.unaccounted);
-        end
     else
         if isfield(metrics_info, 'association')
             fprintf('  滤波关联率(全部/确认): %.2f%% / %.2f%%\n', ...
@@ -516,10 +475,19 @@ if isfield(cfg, 'result_save_file') && ~isempty(cfg.result_save_file)
     if ~isempty(result_dir) && exist(result_dir, 'dir') ~= 7
         mkdir(result_dir);
     end
-    save(cfg.result_save_file, 'cfg', 'frames', 'fused_xyz', 'fused_R', 'fused_ids', ...
-        'passive_bearing', 'fusion_info', 'frame_times', 'est', ...
-        'metrics_info', 'smt', 'event_meta', 'joint_events', '-v7.3');
-    fprintf('结果已保存: %s\n', cfg.result_save_file);
+    save_mode = get_struct_field(cfg, 'result_save_mode', 'summary');
+    if strcmp(save_mode, 'full')
+        save(cfg.result_save_file, 'cfg', 'frames', 'fused_xyz', 'fused_R', 'fused_ids', ...
+            'passive_bearing', 'fusion_info', 'frame_times', 'est', ...
+            'metrics_info', 'smt', 'event_meta', 'joint_events', ...
+            'coherence_info', '-v7.3');
+    else
+        payload = struct('cfg', cfg, 'fusion_info', fusion_info, ...
+            'metrics_info', metrics_info, 'coherence_info', coherence_info, ...
+            'est', compact_estimate_summary(est));
+        save(cfg.result_save_file, '-struct', 'payload', '-v7.3');
+    end
+    fprintf('结果已保存[%s]: %s\n', save_mode, cfg.result_save_file);
 end
 
 fprintf('\n完成！\n');
@@ -530,4 +498,77 @@ if isstruct(s) && isfield(s, name) && ~isempty(s.(name))
 else
     value = fallback;
 end
+end
+
+function summary = compact_estimate_summary(est)
+summary = struct('saved_history_level', 'summary', ...
+    'omitted_full_history', true);
+fields = {'framework', 'backbone', 'online_causal', 'processing_passes', ...
+    'processing_architecture', 'filter_times', 'N', 'N2', 'N_total', ...
+    'mode_counts', 'timing', 'stats', 'confirmation', 'status_legend', ...
+    'output_freshness', 'transition_log', 'output_status_log', ...
+    'input_accounting'};
+for k = 1:numel(fields)
+    name = fields{k};
+    if isfield(est, name)
+        summary.(name) = est.(name);
+    end
+end
+end
+
+function accounting = assert_joint_input_conservation(coherence_info, est, cfg)
+s = est.stats;
+accounting = struct();
+accounting.active_raw_input = coherence_info.n_active_input;
+accounting.active_condensed = coherence_info.n_active_condensed;
+accounting.active_rae_to_filter = get_struct_field(s, 'input_active_rae', 0);
+accounting.active_ae_to_filter = get_struct_field(s, 'input_active_ae_only', 0);
+accounting.active_ae_duplicate = get_struct_field(s, ...
+    'angle_shard_duplicates_active', 0);
+accounting.active_disabled = get_struct_field(s, 'input_active_ae_disabled', 0);
+accounting.active_accounted = accounting.active_condensed + ...
+    accounting.active_rae_to_filter + accounting.active_ae_to_filter + ...
+    accounting.active_ae_duplicate + accounting.active_disabled;
+
+accounting.passive_raw_input = coherence_info.n_passive_input;
+accounting.passive_ae_to_filter = get_struct_field(s, 'input_passive_ae', 0);
+accounting.passive_ae_duplicate = get_struct_field(s, ...
+    'angle_shard_duplicates_passive', 0);
+if logical(get_struct_field(cfg, 'passive_bearing_enabled', true))
+    accounting.passive_disabled = get_struct_field(s, ...
+        'input_passive_disabled', 0);
+else
+    accounting.passive_disabled = accounting.passive_raw_input;
+end
+accounting.passive_accounted = accounting.passive_ae_to_filter + ...
+    accounting.passive_ae_duplicate + accounting.passive_disabled;
+
+accounting.filter_active_inputs = get_struct_field(s, 'active_measurements', 0);
+accounting.filter_angle_inputs = get_struct_field(s, 'passive_measurements', 0);
+accounting.unaccounted = get_struct_field(s, 'active_unaccounted', 0) + ...
+    get_struct_field(s, 'passive_unaccounted', 0);
+expected_filter_angles = accounting.passive_ae_to_filter + ...
+    accounting.active_ae_to_filter;
+accounting.ok = accounting.active_accounted == accounting.active_raw_input && ...
+    accounting.passive_accounted == accounting.passive_raw_input && ...
+    accounting.filter_active_inputs == accounting.active_rae_to_filter && ...
+    accounting.filter_angle_inputs == expected_filter_angles && ...
+    accounting.unaccounted == 0;
+if ~accounting.ok
+    error('run_fusion_main:InputAccountingMismatch', ...
+        ['输入守恒失败：主动原始/解释=%d/%d，被动原始/解释=%d/%d，' ...
+         '滤波主动=%d/%d，滤波角度=%d/%d，未解释=%d。'], ...
+        accounting.active_raw_input, accounting.active_accounted, ...
+        accounting.passive_raw_input, accounting.passive_accounted, ...
+        accounting.filter_active_inputs, accounting.active_rae_to_filter, ...
+        accounting.filter_angle_inputs, expected_filter_angles, ...
+        accounting.unaccounted);
+end
+fprintf(['[输入守恒] 主动原始=%d = 凝聚%d + RAE%d + AE-only%d + 重复%d；' ...
+    '被动原始=%d = 入滤波%d + 重复%d + 禁用%d；未解释=0。\n'], ...
+    accounting.active_raw_input, accounting.active_condensed, ...
+    accounting.active_rae_to_filter, accounting.active_ae_to_filter, ...
+    accounting.active_ae_duplicate, accounting.passive_raw_input, ...
+    accounting.passive_ae_to_filter, accounting.passive_ae_duplicate, ...
+    accounting.passive_disabled);
 end

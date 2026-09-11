@@ -413,7 +413,7 @@ for s = 1:n_sel
     % 当前估计点
     H(s).head = plot3(ax, nan, nan, nan, 'o', 'MarkerEdgeColor', 'k', ...
                       'MarkerFaceColor', col, 'MarkerSize', 7, 'LineWidth', 0.5);
-    H(s).txt  = text(ax, mn(1), mn(2), mn(3), sprintf(' est%d', sel_ids(s)), ...
+    H(s).txt  = text(ax, mn(1), mn(2), mn(3), sprintf(' Track %d', sel_ids(s)), ...
                      'Color', col, 'FontWeight', 'bold', 'FontSize', 9, ...
                      'VerticalAlignment', 'bottom', 'Visible', 'off');
     % 估计协方差椭球：实心、各航迹色
@@ -450,7 +450,7 @@ end
 % 图例：航迹 + 伪真值
 if n_sel >= 1
     leg_h = [H.line];
-    leg_s = arrayfun(@(g) sprintf('est%d', g), sel_ids, 'UniformOutput', false);
+    leg_s = arrayfun(@(g) sprintf('Track %d', g), sel_ids, 'UniformOutput', false);
     if n_tr > 0
         leg_h = [leg_h, HT];
         leg_s = [leg_s, arrayfun(@(e) local_truth_display_name(e.tid, truth_split_info, truth_use_split), ...
@@ -460,7 +460,8 @@ if n_sel >= 1
         vsm = arrayfun(@(s) SM(s).n > 0, 1:n_sel);
         if any(vsm)
             leg_h = [leg_h, HS(vsm)];
-            leg_s = [leg_s, arrayfun(@(g) sprintf('est%d平滑', g), sel_ids(vsm), 'UniformOutput', false)];
+            leg_s = [leg_s, arrayfun(@(g) sprintf('Track %d 平滑', g), ...
+                sel_ids(vsm), 'UniformOutput', false)];
         end
     end
     legend(ax, leg_h, leg_s, 'Location', 'bestoutside');
@@ -519,7 +520,13 @@ end
                 if ~isempty(hi)
                     ph = EST(s).p(:, hi);
                     set(H(s).head, 'XData', ph(1), 'YData', ph(2), 'ZData', ph(3));
-                    set(H(s).txt, 'Position', ph', 'Visible', 'on');
+                    first_visible = find(me, 1);
+                    if isempty(first_visible)
+                        set(H(s).txt, 'Visible', 'off');
+                    else
+                        p0 = EST(s).p(:, first_visible);
+                        set(H(s).txt, 'Position', p0', 'Visible', 'on');
+                    end
                     if show_cov && ~isempty(H(s).cov)
                         [Xe, Ye, Ze] = cov_ellipsoid(EST(s).C(:, :, hi), ph, ...
                                                      ux, uy, uz, cov_sigma * cov_inflate);

@@ -60,8 +60,7 @@ for i = 1:T
         'Color', colS(i, :), 'LineWidth', smooth_width); %#ok<AGROW>
     plot3(ax1, s.smooth(1, 1), s.smooth(2, 1), s.smooth(3, 1), 'o', ...
         'MarkerEdgeColor', 'k', 'MarkerFaceColor', colS(i, :), 'MarkerSize', 5);
-    text(ax1, s.smooth(1, 1), s.smooth(2, 1), s.smooth(3, 1), sprintf(' est%g', s.id), ...
-        'Color', colS(i, :), 'FontSize', 8, 'FontWeight', 'bold', 'VerticalAlignment', 'bottom');
+    annotate_track_start(ax1, s.smooth, s.id, colS(i, :));
 end
 xlabel(ax1, 'East (m)'); ylabel(ax1, 'North (m)'); zlabel(ax1, 'Up (m)');
 view(ax1, 45, 30); axis(ax1, 'equal');
@@ -85,8 +84,7 @@ for i = 1:T
         'Color', colS(i, :), 'LineWidth', smooth_width); %#ok<AGROW>
     plot(ax2, s.smooth(1, 1), s.smooth(2, 1), 'o', ...
         'MarkerEdgeColor', 'k', 'MarkerFaceColor', colS(i, :), 'MarkerSize', 5);
-    text(ax2, s.smooth(1, 1), s.smooth(2, 1), sprintf(' est%g', s.id), ...
-        'Color', colS(i, :), 'FontSize', 8, 'FontWeight', 'bold', 'VerticalAlignment', 'bottom');
+    annotate_track_start(ax2, s.smooth(1:2, :), s.id, colS(i, :));
 end
 xlabel(ax2, 'East (m)'); ylabel(ax2, 'North (m)'); axis(ax2, 'equal');
 legend(ax2, [hR2(1), hS2(1)], {'滤波(平滑前)', sprintf('平滑后(%s)', method_txt)}, ...
@@ -109,10 +107,11 @@ if show_axes
         subplot(3, 1, ax); hold on; grid on;
         plot(s.t, s.raw(ax, :), '-', 'Color', [0.55 0.55 0.60], 'LineWidth', 1.0);
         plot(s.t, s.smooth(ax, :), '-', 'Color', [0.20 0.45 0.80], 'LineWidth', 1.8);
+        annotate_track_start(gca, [s.t; s.smooth(ax, :)], s.id, [0.20 0.45 0.80]);
         ylabel(sprintf('%s (m)', names{ax}));
         if ax == 1
             legend({'滤波(平滑前)', '平滑后'}, 'Location', 'best');
-            title(sprintf('est%g 单轴时序 平滑前/后 (%s, 位移RMS=%.2fm)', ...
+            title(sprintf('Track %g 单轴时序 平滑前/后 (%s, 位移RMS=%.2fm)', ...
                 s.id, method_txt, s.rms_shift));
         end
         if ax == 3, xlabel('Time (s)'); end

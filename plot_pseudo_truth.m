@@ -20,10 +20,17 @@ function info = plot_pseudo_truth(est, frame_times, opts)
 %     line_width  伪真值线宽                                          默认 2.0
 %     meas_color  量测颜色                                            默认 [0.7 0.7 0.7]
 %     no_figure   true=只返回伪真值轨迹数据，不创建3D图                 默认 false
+%     events      联合二维/三维事件；提供后同时返回完整角度和ENU真值序列 默认 []
+%     truth_all   true=忽略航迹选择，返回数据中的全部真值目标           默认 false
 
 if nargin < 3 || isempty(opts), opts = struct(); end
 gp = @(f, d) ppt_get(opts, f, d);
 K = numel(frame_times);
+joint_events = gp('events', []);
+if isstruct(joint_events) && ~isempty(joint_events)
+    info = collect_joint_truth(est, joint_events, opts);
+    return;
+end
 
 %% —— 诊断：assoc / tid 是否可用 ——
 info = struct('has_assoc', false, 'frames_with_assoc', 0, ...
@@ -109,7 +116,7 @@ if has_assoc
                     TrackTid(end+1) = tc;          %#ok<AGROW>
                     if ~isempty(track_id_map) && isKey(track_id_map, As.id(c))
                         s = track_id_map(As.id(c));
-                        TrackTidVotes{s}(end+1) = tc; %#ok<AGROW>
+                        TrackTidVotes{s}(end+1) = tc;
                     end
                 end
             end
@@ -187,13 +194,16 @@ end
 
 %% —— 选定要画的 tid ——
 tids_opt = gp('tids', []);
+truth_all = gp('truth_all', false) ~= 0;
 tid_select_mode = lower(gp('tid_select_mode', 'all_touched'));
 if ~ismember(tid_select_mode, {'all_touched', 'dominant'})
     fprintf('[伪真值诊断] 未知 tid_select_mode=%s，按 all_touched 处理。\n', tid_select_mode);
     tid_select_mode = 'all_touched';
 end
 available_tids = unique(AllTid(isfinite(AllTid)));
-if isempty(tids_opt)
+if truth_all
+    use_tids = available_tids;
+elseif isempty(tids_opt)
     if ~isempty(track_ids)
         use_tids = zeros(1, 0);
         summary = repmat(struct('track_id', NaN, 'main_tid', NaN, ...
@@ -322,6 +332,282 @@ hold(ax, 'off');
 end
 
 %% ═══════════════════════════════════════════════════════════════════════════
+function info = collect_joint_truth(est, events, opts)
+cfg = ppt_get(opts, 'cfg', struct());
+use_split = ppt_get(opts, 'truth_use_split', []);
+if isempty(use_split)
+    use_split = isstruct(cfg) && isfield(cfg, 'truth_id_split_enabled') && ...
+        ~isempty(cfg.truth_id_split_enabled) && cfg.truth_id_split_enabled ~= 0;
+end
+cfg.truth_id_split_enabled = logical(use_split);
+labels = build_joint_truth_labels(events, cfg);
+all_keys = labels.summary.instance_labels;
+[all_tracks, n_points, n_frames] = joint_truth_series(events, labels);
+
+track_ids = unique(reshape(ppt_get(opts, 'track_ids', []), 1, []));
+summaries = joint_track_truth_summary(est, events, labels, track_ids);
+mode = lower(ppt_get(opts, 'tid_select_mode', 'all_touched'));
+if ~ismember(mode, {'all_touched', 'dominant'})
+    fprintf('[伪真值诊断] 未知 tid_select_mode=%s，按 all_touched 处理。\n', mode);
+    mode = 'all_touched';
+end
+explicit = reshape(ppt_get(opts, 'tids', []), 1, []);
+truth_all = ppt_get(opts, 'truth_all', false) ~= 0;
+if truth_all || (isempty(track_ids) && isempty(explicit))
+    selected_keys = all_keys;
+elseif ~isempty(explicit)
+    selected_keys = intersect(unique(explicit(isfinite(explicit))), all_keys);
+else
+    selected_keys = zeros(1, 0);
+    for i = 1:numel(summaries)
+        if strcmp(mode, 'dominant')
+            add = summaries(i).main_tid;
+        else
+            add = summaries(i).touched_tids;
+        end
+        selected_keys = [selected_keys, add(isfinite(add))]; %#ok<AGROW>
+    end
+    selected_keys = intersect(unique(selected_keys), all_keys);
+end
+
+keep = ismember([all_tracks.tid], selected_keys);
+tracks = all_tracks(keep);
+info = struct('has_assoc', isfield(est, 'assoc') && ~isempty(est.assoc), ...
+    'frames_with_assoc', 0, 'n_points', n_points, 'n_finite_tid', n_points, ...
+    'n_assoc_points', sum([summaries.total_count]), ...
+    'n_assoc_finite_tid', sum([summaries.total_count]), ...
+    'truth_source', '联合二维/三维事件(joint events)', ...
+    'frames_with_truth_source', n_frames, ...
+    'truth_use_split', logical(use_split), 'truth_split_info', labels.summary, ...
+    'track_tid_summary', summaries, 'tid_select_mode', mode, ...
+    'tids', selected_keys, 'pts_per_tid', arrayfun(@joint_track_point_count, tracks), ...
+    'TRk', tracks);
+if info.has_assoc
+    info.frames_with_assoc = nnz(cellfun(@(x) ~isempty(x), est.assoc));
+end
+
+fprintf('[伪真值诊断] 联合事件完整真值：可用=%s，本次绘制=%s，模式=%s。\n', ...
+    mat2str(all_keys), mat2str(selected_keys), mode);
+for i = 1:numel(summaries)
+    if numel(summaries(i).touched_tids) > 1
+        fprintf('[伪真值诊断] 航迹ID=%g 碰过tid=%s，对应次数=%s；主导tid=%g (%d/%d)。\n', ...
+            summaries(i).track_id, mat2str(summaries(i).touched_tids), ...
+            mat2str(summaries(i).counts), summaries(i).main_tid, ...
+            summaries(i).main_count, summaries(i).total_count);
+    end
+end
+
+if ppt_get(opts, 'no_figure', false) ~= 0, return; end
+plot_joint_truth_figures(tracks, labels.summary, logical(use_split), ...
+    ppt_get(opts, 'line_width', 2.0));
+end
+
+function [tracks, n_points, n_frames] = joint_truth_series(events, labels)
+keys = labels.summary.instance_labels;
+template = struct('tid', NaN, 'label', '', 't', zeros(1, 0), ...
+    'p', zeros(3, 0), 'angle_t', zeros(1, 0), 'angle', zeros(2, 0));
+tracks = repmat(template, 1, numel(keys));
+for i = 1:numel(keys)
+    tracks(i).tid = keys(i);
+    tracks(i).label = joint_truth_label(labels.summary, keys(i));
+end
+n_points = 0; n_frames = 0;
+for k = 1:numel(events)
+    e = events(k); used = false;
+    na = e.active.n_meas; np = e.passive.n_meas;
+    active_keys = joint_sized_row(labels.active{k}, na, NaN);
+    passive_keys = joint_sized_row(labels.passive{k}, np, NaN);
+    active_t = joint_measurement_times(e.active.t_sec, na, e.t_sec);
+    passive_t = joint_measurement_times(e.passive.t_sec, np, e.t_sec);
+    for j = 1:na
+        slot = find(keys == active_keys(j), 1);
+        if isempty(slot), continue; end
+        if size(e.active.rae, 1) >= 3 && j <= size(e.active.rae, 2) && ...
+                all(isfinite(e.active.rae(2:3, j)))
+            tracks(slot).angle_t(end + 1) = active_t(j);
+            tracks(slot).angle(:, end + 1) = e.active.rae(2:3, j);
+            n_points = n_points + 1; used = true;
+        end
+        has_range = j <= numel(e.active.has_range) && e.active.has_range(j);
+        if has_range && size(e.active.xyz, 1) >= 3 && j <= size(e.active.xyz, 2) && ...
+                all(isfinite(e.active.xyz(1:3, j)))
+            tracks(slot).t(end + 1) = active_t(j);
+            tracks(slot).p(:, end + 1) = e.active.xyz(1:3, j);
+        end
+    end
+    for j = 1:np
+        slot = find(keys == passive_keys(j), 1);
+        if isempty(slot) || size(e.passive.ang, 1) < 2 || ...
+                j > size(e.passive.ang, 2) || any(~isfinite(e.passive.ang(1:2, j)))
+            continue;
+        end
+        tracks(slot).angle_t(end + 1) = passive_t(j);
+        tracks(slot).angle(:, end + 1) = e.passive.ang(1:2, j);
+        n_points = n_points + 1; used = true;
+    end
+    n_frames = n_frames + used;
+end
+for i = 1:numel(tracks)
+    [tracks(i).angle_t, tracks(i).angle] = joint_merge_angle( ...
+        tracks(i).angle_t, tracks(i).angle);
+    [tracks(i).t, tracks(i).p] = joint_merge_linear(tracks(i).t, tracks(i).p);
+end
+end
+
+function summary = joint_track_truth_summary(est, events, labels, track_ids)
+summary = repmat(struct('track_id', NaN, 'main_tid', NaN, ...
+    'main_count', 0, 'total_count', 0, 'touched_tids', [], 'counts', []), ...
+    1, numel(track_ids));
+votes = cell(1, numel(track_ids));
+for i = 1:numel(track_ids)
+    summary(i).track_id = track_ids(i); votes{i} = zeros(1, 0);
+end
+if isempty(track_ids), return; end
+for k = 1:numel(events)
+    a = joint_event_assoc(est, k);
+    for q = 1:numel(a.id)
+        i = find(track_ids == a.id(q), 1);
+        if isempty(i), continue; end
+        key = joint_assoc_truth_key(a, q, labels, k);
+        if isfinite(key), votes{i}(end + 1) = key; end
+    end
+end
+for i = 1:numel(track_ids)
+    if isempty(votes{i})
+        votes{i} = joint_output_truth_votes(est, events, labels, track_ids(i));
+    end
+    u = unique(votes{i}(isfinite(votes{i}))); cnt = zeros(size(u));
+    for j = 1:numel(u), cnt(j) = nnz(votes{i} == u(j)); end
+    summary(i).total_count = sum(cnt); summary(i).touched_tids = u;
+    summary(i).counts = cnt;
+    if ~isempty(cnt)
+        [summary(i).main_count, j] = max(cnt);
+        summary(i).main_tid = u(j);
+    end
+end
+end
+
+function a = joint_event_assoc(est, k)
+a = struct('id', zeros(1, 0), 'type', {cell(1, 0)}, ...
+    'meas_index', zeros(1, 0), 'tid', zeros(1, 0));
+if isfield(est, 'assoc') && k <= numel(est.assoc) && ~isempty(est.assoc{k})
+    a = est.assoc{k};
+end
+end
+
+function key = joint_assoc_truth_key(a, q, labels, k)
+key = NaN;
+if isfield(a, 'type') && q <= numel(a.type) && ...
+        isfield(a, 'meas_index') && q <= numel(a.meas_index)
+    type = a.type{q}; mi = a.meas_index(q);
+    if isstring(type) && isscalar(type), type = char(type); end
+    if ischar(type) && isfinite(mi) && mi >= 1 && mi == round(mi)
+        if strncmp(type, 'active', 6), x = labels.active{k};
+        elseif strncmp(type, 'passive', 7), x = labels.passive{k};
+        else, x = zeros(1, 0);
+        end
+        if mi <= numel(x), key = x(mi); end
+    end
+end
+if isfinite(key) || ~isfield(a, 'tid') || q > numel(a.tid) || ~isfinite(a.tid(q))
+    return;
+end
+raw = a.tid(q); summary = labels.summary;
+candidates = summary.instance_labels(summary.key_raw_id == raw);
+if numel(candidates) == 1, key = candidates; end
+end
+
+function votes = joint_output_truth_votes(est, events, labels, track_id)
+votes = zeros(1, 0);
+if ~isfield(est, 'output'), return; end
+for k = 1:min(numel(events), numel(est.output))
+    out = est.output{k};
+    for q = find([out.id] == track_id)
+        if ~isfield(out(q), 'truth_id') || ~isfinite(out(q).truth_id), continue; end
+        raw = out(q).truth_id; candidates = labels.summary.instance_labels( ...
+            labels.summary.key_raw_id == raw);
+        if numel(candidates) == 1, votes(end + 1) = candidates; end %#ok<AGROW>
+    end
+end
+end
+
+function plot_joint_truth_figures(tracks, split_info, use_split, line_width)
+has_position = arrayfun(@(x) ~isempty(x.t), tracks);
+if any(has_position)
+    fig = figure('Name', '按目标编号连接的伪真值轨迹', 'Color', 'w', ...
+        'Position', [80, 80, 1000, 800]);
+    ax = axes('Parent', fig); hold(ax, 'on'); grid(ax, 'on'); box(ax, 'on');
+    colors = lines(nnz(has_position)); q = 0;
+    for i = find(has_position)
+        q = q + 1;
+        plot3(ax, tracks(i).p(1, :), tracks(i).p(2, :), tracks(i).p(3, :), '-', ...
+            'Color', colors(q, :), 'LineWidth', line_width, ...
+            'DisplayName', truth_label_long(tracks(i).tid, split_info, use_split));
+    end
+    xlabel(ax, 'East (m)'); ylabel(ax, 'North (m)'); zlabel(ax, 'Up (m)');
+    view(ax, 45, 30); axis(ax, 'equal'); legend(ax, 'Location', 'bestoutside');
+    title(ax, sprintf('按目标编号连接的完整伪真值轨迹 (共%d条)', nnz(has_position)));
+end
+has_angle = arrayfun(@(x) ~isempty(x.angle_t), tracks);
+if any(has_angle)
+    figure('Name', '按目标编号连接的二维角度伪真值', 'Color', 'w', ...
+        'Position', [110, 110, 900, 700]);
+    hold on; grid on; box on; colors = lines(nnz(has_angle)); q = 0;
+    for i = find(has_angle)
+        q = q + 1;
+        plot(tracks(i).angle(1, :), tracks(i).angle(2, :), '-', ...
+            'Color', colors(q, :), 'LineWidth', line_width, ...
+            'DisplayName', truth_label_long(tracks(i).tid, split_info, use_split));
+    end
+    xlabel('方位角 (deg)'); ylabel('俯仰角 (deg)');
+    title(sprintf('按目标编号连接的完整二维角度伪真值 (共%d条)', nnz(has_angle)));
+    legend('Location', 'bestoutside'); hold off;
+end
+end
+
+function n = joint_track_point_count(track)
+n = max(numel(track.t), numel(track.angle_t));
+end
+
+function label = joint_truth_label(summary, key)
+label = sprintf('%g', key); i = find(summary.instance_labels == key, 1);
+if ~isempty(i) && i <= numel(summary.instance_label_text)
+    label = summary.instance_label_text{i};
+end
+end
+
+function [t, z] = joint_merge_angle(t, z)
+if isempty(t), t = zeros(1, 0); z = zeros(2, 0); return; end
+[t, order] = sort(t(:).'); z = z(:, order); [u, ~, group] = unique(t, 'stable');
+merged = nan(2, numel(u));
+for i = 1:numel(u)
+    q = group == i;
+    merged(:, i) = [atan2d(mean(sind(z(1, q))), mean(cosd(z(1, q)))); mean(z(2, q))];
+end
+t = u; z = merged;
+end
+
+function [t, z] = joint_merge_linear(t, z)
+if isempty(t), t = zeros(1, 0); z = zeros(size(z, 1), 0); return; end
+[t, order] = sort(t(:).'); z = z(:, order); [u, ~, group] = unique(t, 'stable');
+merged = nan(size(z, 1), numel(u));
+for i = 1:numel(u), merged(:, i) = mean(z(:, group == i), 2); end
+t = u; z = merged;
+end
+
+function x = joint_sized_row(x0, n, fill)
+x = fill * ones(1, n);
+if n == 0 || isempty(x0), return; end
+m = min(n, numel(x0)); x(1:m) = reshape(x0(1:m), 1, []);
+end
+
+function t = joint_measurement_times(t0, n, fallback)
+t = fallback * ones(1, n);
+if n == 0 || isempty(t0), return; end
+if isscalar(t0), t(:) = t0; else, m = min(n, numel(t0)); t(1:m) = t0(1:m); end
+end
+
+%% ═══════════════════════════════════════════════════════════════════════════
 function plot_filter_overlay(ax, est, K)
 pos_idx = [1, 4, 7];
 seen = containers.Map('KeyType', 'double', 'ValueType', 'any');
@@ -339,6 +625,7 @@ ks = seen.keys;
 for i = 1:numel(ks)
     p = seen(ks{i});
     plot3(ax, p(1, :), p(2, :), p(3, :), '--', 'Color', [0.55 0.55 0.55], 'LineWidth', 0.8);
+    annotate_track_start(ax, p, ks{i}, [0.40 0.40 0.40]);
 end
 end
 

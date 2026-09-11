@@ -14,13 +14,12 @@ function [frames, info] = cohere_measurements(active_list, passive_list, platfor
 %      frames(k).active_rae   主动量测 [3×M_a] 地理系 [range; az_deg; el_deg]
 %      frames(k).active_R     主动量测ENU协方差 [3×3×M_a]
 %      frames(k).passive_ang  被动量测 [2×M_p] [az_deg; el_deg]
-%      frames(k).passive_src  被动量测来源索引 [1×M_p]
-%      frames(k).active_src   主动量测来源索引 [1×M_a]
+%      frames(k).passive_src  被动量测文件分片索引 [1×M_p]
+%      frames(k).active_src   主动物理雷达索引 [1×M_a]
 %      frames(k).target_ids   主动目标编号 [1×M_a]
 %      frames(k).passive_ids  被动目标编号 [1×M_p]
 %      frames(k).active_t     主动量测原始时间 [1×M_a]
 %      frames(k).passive_t    被动量测原始时间 [1×M_p]
-%    info : 凝聚前后物理量测计数。主、被动独立分帧，帧按代表时间排序。
 %
 %  坐标转换链:
 %    平台(lat,lon,alt) → ECEF
@@ -39,6 +38,8 @@ all_tid_active = nan(n_active_total, 1);
 all_src_active = zeros(n_active_total, 1);
 
 cursor = 0;
+share_active_sensor = logical(local_get_cfg(cfg, ...
+    'active_files_share_sensor', true));
 for i = 1:numel(active_list)
     ad = active_list{i};
     n = ad.n_meas;
@@ -53,17 +54,35 @@ for i = 1:numel(active_list)
         all_range_valid_active(jj) = isfinite(ad.range_m) & ad.range_m > 0;
     end
     all_tid_active(jj) = ad.target_id;
-    all_src_active(jj) = i;
+    if share_active_sensor
+        all_src_active(jj) = 1;
+    else
+        all_src_active(jj) = i;
+    end
 end
 
 fprintf('主动量测总计: %d 点\n', numel(all_t_active));
+if numel(active_list) > 1
+    if share_active_sensor
+        fprintf('主动物理源: 1部雷达, %d个TXT分片\n', numel(active_list));
+    else
+        fprintf('主动物理源: %d部独立雷达（每个TXT对应一部）\n', numel(active_list));
+    end
+end
 
 %% ── 合并所有被动量测 ──────────────────────────────────────────────────
 n_passive_total = sum(cellfun(@(x) x.n_meas, passive_list));
+info = struct('n_active_input', n_active_total, ...
+    'n_active_rae_input', nnz(all_range_valid_active), ...
+    'n_active_ae_only_input', nnz(~all_range_valid_active), ...
+    'n_passive_input', n_passive_total, ...
+    'n_active_after_condensation', 0, ...
+    'n_passive_after_condensation', 0, ...
+    'n_active_condensed', 0);
 all_t_passive = zeros(n_passive_total, 1);
 all_az_passive = zeros(n_passive_total, 1);
 all_el_passive = zeros(n_passive_total, 1);
-all_passive_src = zeros(n_passive_total, 1);  % 来源文件索引
+all_passive_src = zeros(n_passive_total, 1);  % 文件分片索引
 all_tid_passive = nan(n_passive_total, 1);
 
 cursor = 0;
@@ -79,6 +98,22 @@ for i = 1:numel(passive_list)
 end
 
 fprintf('被动量测总计: %d 点\n', numel(all_t_passive));
+
+% Platform interpolation clamps outside its time range. Make any coverage
+% mismatch explicit because endpoint clamping biases moving-platform geometry.
+all_meas_t = [all_t_active; all_t_passive];
+if ~isempty(all_meas_t) && isfield(platform, 't_sec') && ~isempty(platform.t_sec)
+    tol_t = max(local_get_cfg(cfg, 'frame_time_window_s', 0.015), 1e-6);
+    outside = all_meas_t < min(platform.t_sec) - tol_t | ...
+        all_meas_t > max(platform.t_sec) + tol_t;
+    if any(outside)
+        warning('cohere_measurements:PlatformTimeCoverage', ...
+            ['%d/%d个量测时间超出平台轨迹覆盖区间；平台位置将钳位到端点。' ...
+            '量测=[%.3f, %.3f]s，平台=[%.3f, %.3f]s。'], ...
+            nnz(outside), numel(all_meas_t), min(all_meas_t), max(all_meas_t), ...
+            min(platform.t_sec), max(platform.t_sec));
+    end
+end
 
 %% ── 设定坐标锚点 ──────────────────────────────────────────────────────
 if platform.n_rows < 1
@@ -169,78 +204,102 @@ end
 fprintf('主动量测坐标转换完成: %d 点\n', n_act);
 
 %% ── 时间分帧 ──────────────────────────────────────────────────────────
-% 主、被动各自按时间窗口分组；被动帧不参与主动凝聚。
-info = struct('n_active_input', n_active_total, ...
-    'n_passive_input', n_passive_total, 'n_active_after_condensation', 0, ...
-    'n_passive_after_condensation', 0, 'n_active_condensed', 0);
+% 策略：将所有量测（主动+被动）按时间排序，用滑动时间窗口分帧
+% 每帧的窗口内包含该时间段的所有量测
 
-if isempty(all_t_active) && isempty(all_t_passive)
+% 收集所有时间戳
+all_times = all_t_active;
+if ~isempty(all_t_passive)
+    all_times = [all_times; all_t_passive];
+end
+all_times = sort(all_times);
+
+if isempty(all_times)
     frames = struct('t_sec', {}, 'active_xyz', {}, 'active_rae', {}, 'active_R', {}, ...
+                    'active_ang_precondense', {}, ...
                     'active_ae_only', {}, 'active_ae_only_src', {}, ...
                     'active_ae_only_ids', {}, 'active_ae_only_t', {}, ...
                     'passive_ang', {}, 'passive_src', {}, 'active_src', {}, ...
                     'target_ids', {}, 'passive_ids', {}, ...
                     'active_t', {}, 'passive_t', {});
+    info.n_active_after_condensation = 0;
+    info.n_passive_after_condensation = 0;
+    info.n_active_condensed = info.n_active_input;
     fprintf('警告: 无量测数据\n');
     return;
 end
 
-% Independent modality windows prevent passive timing from changing active
-% condensation membership, representative timestamps or micro-track age.
+% 用时间窗口分帧
 tw = cfg.frame_time_window_s;
-[active_starts, active_groups] = independent_time_windows(all_t_active, tw);
-[passive_starts, passive_groups] = independent_time_windows(all_t_passive, tw);
-n_active_frames = numel(active_starts);
-n_frames = n_active_frames + numel(passive_starts);
-frame_times = [active_starts, passive_starts];
+frame_times = zeros(1, numel(all_times));
+n_frame_times = 0;
 
-fprintf('独立时间分帧: 主动=%d帧, 被动=%d帧 (窗口=%.3f s)\n', ...
-    n_active_frames, numel(passive_starts), tw);
+i = 1;
+while i <= numel(all_times)
+    n_frame_times = n_frame_times + 1;
+    frame_times(n_frame_times) = all_times(i);
+    % 找到窗口结束位置
+    t_start = all_times(i);
+    j = i;
+    while j <= numel(all_times) && (all_times(j) - t_start) <= tw
+        j = j + 1;
+    end
+    i = j;
+end
+frame_times = frame_times(1:n_frame_times);
+
+n_frames = numel(frame_times);
+
+fprintf('时间分帧: %d 帧 (窗口=%.3f s)\n', n_frames, tw);
+if n_frames > 1
+    dt_frames = diff(frame_times);
+    fprintf('  帧间间隔: min=%.4f s, median=%.4f s, max=%.4f s\n', ...
+        min(dt_frames), median(dt_frames), max(dt_frames));
+end
 
 %% ── 构建每帧数据结构 ──────────────────────────────────────────────────
 frames = struct();
 frames(n_frames).t_sec = [];  % 预分配
 frame_cov = cell(1, n_frames);   % 每帧主动量测协方差(并行存储,内部用)
+active_frame_indices = partition_frame_indices(all_t_active, frame_times, tw);
+passive_frame_indices = partition_frame_indices(all_t_passive, frame_times, tw);
 
 for k = 1:n_frames
     t_k = frame_times(k);
 
-    if k <= n_active_frames
-        act_mask = active_groups == k;
-        pas_mask = false(size(all_t_passive));
-    else
-        act_mask = false(size(all_t_active));
-        pas_mask = passive_groups == k - n_active_frames;
-    end
+    act_idx = active_frame_indices{k};
+    pas_idx = passive_frame_indices{k};
 
     % 帧代表时刻只服务于主动量测的 frame 时间模式；所有被动量测仍保留
     % passive_t 中的原始时间戳，异步事件构造不会把它们插值到帧代表时刻。
-    if any(act_mask)
-        t_rep = median(all_t_active(act_mask));
-    elseif any(pas_mask)
-        t_rep = median(all_t_passive(pas_mask));
+    if ~isempty(act_idx)
+        t_rep = median(all_t_active(act_idx));
+    elseif ~isempty(pas_idx)
+        t_rep = median(all_t_passive(pas_idx));
     else
         t_rep = t_k;
     end
 
     frames(k).t_sec        = t_rep;
-    act3_mask = act_mask & all_range_valid_active;
-    act2_mask = act_mask & ~all_range_valid_active;
-    frames(k).active_xyz   = active_xyz_local(:, act3_mask);
-    frames(k).active_rae   = active_rae_orig(:, act3_mask);
-    frames(k).active_R     = active_cov_local(:, :, act3_mask);
-    frames(k).active_ae_only = [all_az_active(act2_mask)'; all_el_active(act2_mask)'];
-    frames(k).active_ae_only_src = all_src_active(act2_mask)';
-    frames(k).active_ae_only_ids = all_tid_active(act2_mask)';
-    frames(k).active_ae_only_t = all_t_active(act2_mask)';
-    frames(k).passive_ang  = [all_az_passive(pas_mask)'; all_el_passive(pas_mask)'];
-    frames(k).passive_src  = all_passive_src(pas_mask)';
-    frames(k).active_src   = all_src_active(act3_mask)';
-    frames(k).target_ids   = all_tid_active(act3_mask)';
-    frames(k).passive_ids  = all_tid_passive(pas_mask)';
-    frames(k).active_t     = all_t_active(act3_mask)';
-    frames(k).passive_t    = all_t_passive(pas_mask)';
-    frame_cov{k}           = active_cov_local(:, :, act3_mask);
+    act3_idx = act_idx(all_range_valid_active(act_idx));
+    act2_idx = act_idx(~all_range_valid_active(act_idx));
+    frames(k).active_xyz   = active_xyz_local(:, act3_idx);
+    frames(k).active_rae   = active_rae_orig(:, act3_idx);
+    frames(k).active_R     = active_cov_local(:, :, act3_idx);
+    frames(k).active_ae_only = [all_az_active(act2_idx)'; all_el_active(act2_idx)'];
+    frames(k).active_ang_precondense = [active_rae_orig(2:3, act3_idx), ...
+        frames(k).active_ae_only];
+    frames(k).active_ae_only_src = all_src_active(act2_idx)';
+    frames(k).active_ae_only_ids = all_tid_active(act2_idx)';
+    frames(k).active_ae_only_t = all_t_active(act2_idx)';
+    frames(k).passive_ang  = [all_az_passive(pas_idx)'; all_el_passive(pas_idx)'];
+    frames(k).passive_src  = all_passive_src(pas_idx)';
+    frames(k).active_src   = all_src_active(act3_idx)';
+    frames(k).target_ids   = all_tid_active(act3_idx)';
+    frames(k).passive_ids  = all_tid_passive(pas_idx)';
+    frames(k).active_t     = all_t_active(act3_idx)';
+    frames(k).passive_t    = all_t_passive(pas_idx)';
+    frame_cov{k}           = active_cov_local(:, :, act3_idx);
 end
 
 %% ── 帧内主动空时凝聚（可选） ──────────────────────────────────────────
@@ -250,35 +309,24 @@ end
 %    'resolution'     仅 per-sensor 分辨单元去重(各向异性统计门, 信息加权融合)
 %    'radius'         旧逻辑：固定半径欧氏质心聚类(回退用)
 condense_enable = isfield(cfg, 'condense_enable') && cfg.condense_enable;
-if condense_enable && n_active_frames > 0
+if condense_enable
     method = lower(local_get_cfg(cfg, 'condense_method', 'spatiotemporal'));
     n_before = sum(cellfun(@(x) size(x, 2), {frames.active_xyz}));
-    active_frames = frames(1:n_active_frames);
-    active_cov = frame_cov(1:n_active_frames);
     switch method
         case 'radius'
-            active_frames = condense_radius(active_frames, cfg);
+            frames = condense_radius(frames, cfg);
         case 'resolution'
-            active_frames = condense_resolution(active_frames, active_cov, cfg);
+            frames = condense_resolution(frames, frame_cov, cfg);
         case 'spatiotemporal'
-            active_frames = condense_spatiotemporal(active_frames, active_cov, cfg);
+            frames = condense_spatiotemporal(frames, frame_cov, cfg);
         otherwise
             warning('未知 condense_method=%s，改用 spatiotemporal', method);
-            active_frames = condense_spatiotemporal(active_frames, active_cov, cfg);
+            frames = condense_spatiotemporal(frames, frame_cov, cfg);
     end
-    % XYZ is the fused physical point. Rebuild RAE from that same point and
-    % the platform position at the fused timestamp so both filter branches
-    % consume one geometrically consistent measurement.
-    active_frames = reconcile_condensed_rae( ...
-        active_frames, platform, anchor_ecef, R_ecef2enu_anchor);
-    frames(1:n_active_frames) = active_frames;
     n_after = sum(cellfun(@(x) size(x, 2), {frames.active_xyz}));
     fprintf('主动空时凝聚[%s]: %d → %d 点 (压缩比=%.1f%%)\n', ...
         method, n_before, n_after, 100*(1 - n_after/max(n_before, 1)));
 end
-
-[~, order] = sort([frames.t_sec]);
-frames = frames(order);
 
 % 统计
 n_act_total = sum(cellfun(@(x) size(x,2), {frames.active_xyz}));
@@ -286,28 +334,45 @@ n_act_ae_only = sum(cellfun(@(x) size(x,2), {frames.active_ae_only}));
 n_pas_total = sum(cellfun(@(x) size(x,2), {frames.passive_ang}));
 info.n_active_after_condensation = n_act_total + n_act_ae_only;
 info.n_passive_after_condensation = n_pas_total;
-info.n_active_condensed = n_active_total - info.n_active_after_condensation;
+info.n_active_condensed = info.n_active_input - info.n_active_after_condensation;
+if info.n_active_condensed < 0 || info.n_passive_after_condensation ~= info.n_passive_input
+    error('cohere_measurements:InputAccountingMismatch', ...
+        '空时凝聚输入守恒失败：主动差额=%d，被动差额=%d。', ...
+        info.n_active_condensed, info.n_passive_input - info.n_passive_after_condensation);
+end
 fprintf('分帧结果: %d 帧, 主动RAE=%d, 主动AE-only=%d, 被动AE=%d\n', ...
     n_frames, n_act_total, n_act_ae_only, n_pas_total);
 
 end
 
-function [starts, groups] = independent_time_windows(t, window_s)
-[times, order] = sort(t);
-groups = zeros(size(t));
-starts = zeros(1, numel(t));
-i = 1; n = 0;
-while i <= numel(times)
-    n = n + 1;
-    starts(n) = times(i);
-    j = i + 1;
-    while j <= numel(times) && times(j) - times(i) <= window_s
-        j = j + 1;
+function groups = partition_frame_indices(times, frame_times, tw)
+% Assign sorted timestamps once, then restore the original in-frame order.
+n_frames = numel(frame_times);
+groups = cell(1, n_frames);
+if isempty(times) || n_frames == 0, return; end
+
+[sorted_times, original_indices] = sort(times(:));
+cursor = 1;
+n_times = numel(sorted_times);
+for k = 1:n_frames
+    t_lo = frame_times(k) - 1e-9;
+    while cursor <= n_times && sorted_times(cursor) < t_lo
+        cursor = cursor + 1;
     end
-    groups(order(i:j - 1)) = n;
-    i = j;
+    first = cursor;
+    if k < n_frames
+        upper = frame_times(k + 1);
+        while cursor <= n_times && sorted_times(cursor) < upper
+            cursor = cursor + 1;
+        end
+    else
+        upper = frame_times(k) + tw;
+        while cursor <= n_times && sorted_times(cursor) <= upper
+            cursor = cursor + 1;
+        end
+    end
+    groups{k} = sort(original_indices(first:cursor - 1));
 end
-starts = starts(1:n);
 end
 
 %% ═══════════════════════════════════════════════════════════════════════════
@@ -405,14 +470,14 @@ end
 %% ═══════════════════════════════════════════════════════════════════════════
 function frames = condense_resolution(frames, frame_cov, cfg)
 % 方法4：per-sensor 分辨单元去重（各向异性统计门 + 信息加权融合），每帧独立。
-res = res_params(cfg);
+[res, protect] = res_params(cfg);
 for k = 1:numel(frames)
     M = size(frames(k).active_xyz, 2);
     tm = frame_active_times(frames(k), M);
     if M <= 1, frames(k).active_t = tm; frames(k).active_R = frame_cov{k}; continue; end
     [xo, ro, to, so, Co, tmo] = dedup_resolution_frame(frames(k).active_xyz, ...
         frames(k).active_rae, frames(k).target_ids, frames(k).active_src, ...
-        frame_cov{k}, tm, res);
+        frame_cov{k}, tm, res, protect);
     frames(k).active_xyz = xo; frames(k).active_rae = ro;
     frames(k).target_ids = to; frames(k).active_src = so; frames(k).active_t = tmo;
     frames(k).active_R = Co;
@@ -425,10 +490,9 @@ function frames = condense_spatiotemporal(frames, frame_cov, cfg)
 % 归入同一微航迹（恒速预测门控），每帧每条微航迹只输出一个凝聚点。
 % 关键：交叉目标速度方向不同→即使瞬时空间重合也不会被并；快目标窗内不拖尾。
 % 注意：微航迹仅用于"分组凝聚"，不做状态估计，滤波器完全不受影响。
-res = res_params(cfg);
+[res, protect] = res_params(cfg);
 gamma_trk   = local_get_cfg(cfg, 'condense_gate_gamma',  16);
 gamma_birth = local_get_cfg(cfg, 'condense_birth_gamma',  9);
-merge_births = logical(local_get_cfg(cfg, 'condense_birth_merge_enabled', false));
 amax        = local_get_cfg(cfg, 'condense_amax',        30);
 beta        = local_get_cfg(cfg, 'condense_vel_beta',   0.5);
 coast       = round(local_get_cfg(cfg, 'condense_coast', 3));
@@ -442,8 +506,7 @@ for k = 1:numel(frames)
     tm = frame_active_times(frames(k), M0); t = frames(k).t_sec;
 
     % Stage A：per-sensor 分辨单元去重
-    [xyz, rae, tid, src, cov, tm] = dedup_resolution_frame( ...
-        xyz, rae, tid, src, cov, tm, res);
+    [xyz, rae, tid, src, cov, tm] = dedup_resolution_frame(xyz, rae, tid, src, cov, tm, res, protect);
     M = size(xyz, 2);
 
     % Stage B：恒速预测门控，把点关联到活动微航迹
@@ -459,22 +522,16 @@ for k = 1:numel(frames)
         xhat(:, a) = TRK(ti).x + TRK(ti).v * dt;
         Phat(:, :, a) = TRK(ti).P + eye(3) * (0.5 * amax * dt * dt)^2;
     end
-    C = inf(na, M);
-    for a = 1:na
-        for i = 1:M
+    for i = 1:M
+        bestd = gamma_trk; besta = 0;
+        for a = 1:na
             d = maha2(xyz(:, i) - xhat(:, a), cov(:, :, i) + Phat(:, :, a));
-            if d < gamma_trk, C(a, i) = d; end
+            if d < bestd, bestd = d; besta = a; end
         end
-    end
-    if na > 0 && M > 0
-        pairs = solve_global_assignment(C, gamma_trk);
-        for q = 1:size(pairs, 1)
-            lab(pairs(q, 2)) = act(pairs(q, 1));
-        end
+        if besta > 0, lab(i) = act(besta); end
     end
 
-    % 余点出生。默认每个余点建立独立微航迹，避免没有历史支撑时
-    % 把近邻真实目标压成一个点。仅显式开启时保留旧的出生聚并行为。
+    % 余点出生（马氏门 + ID保护，种子单遍；不可分辨的重复并入同一新航迹）
     left = find(lab == 0); usedl = false(1, numel(left));
     for a = 1:numel(left)
         if usedl(a), continue; end
@@ -482,14 +539,14 @@ for k = 1:numel(frames)
         TRK(end+1) = struct('x', xyz(:, ia), 'v', [0; 0; 0], ...
             'P', cov(:, :, ia), 't', t, 'last_k', k); %#ok<AGROW>
         newid = numel(TRK); lab(ia) = newid; usedl(a) = true;
-        if merge_births
-            for b = a+1:numel(left)
-                if usedl(b), continue; end
-                ib = left(b);
-                if maha2(xyz(:, ia) - xyz(:, ib), ...
-                        cov(:, :, ia) + cov(:, :, ib)) < gamma_birth
-                    lab(ib) = newid; usedl(b) = true;
-                end
+        for b = a+1:numel(left)
+            if usedl(b), continue; end
+            ib = left(b);
+            if protect && isfinite(tid(ia)) && isfinite(tid(ib)) && tid(ia) ~= tid(ib)
+                continue;
+            end
+            if maha2(xyz(:, ia) - xyz(:, ib), cov(:, :, ia) + cov(:, :, ib)) < gamma_birth
+                lab(ib) = newid; usedl(b) = true;
             end
         end
     end
@@ -516,7 +573,7 @@ end
 end
 
 %% ═══════════════════════════════════════════════════════════════════════════
-function [xo, ro, to, so, Co, tmo] = dedup_resolution_frame(xyz, rae, tid, src, cov, tm, res)
+function [xo, ro, to, so, Co, tmo] = dedup_resolution_frame(xyz, rae, tid, src, cov, tm, res, protect)
 % 单帧内：同一传感器、且RAE落在分辨单元内的点视为不可分辨重复，信息加权合并。
 M = size(xyz, 2);
 if M == 0, xo = xyz; ro = rae; to = tid; so = src; Co = cov; tmo = tm; return; end
@@ -530,6 +587,9 @@ for s = usrc
         for b = a+1:numel(mi)
             if used(b), continue; end
             ib = mi(b);
+            if protect && isfinite(tid(ia)) && isfinite(tid(ib)) && tid(ia) ~= tid(ib)
+                continue;
+            end
             if abs(rae(1, ia) - rae(1, ib)) < res(1) && ...
                abs(angdiff_deg(rae(2, ia), rae(2, ib))) < res(2) && ...
                abs(rae(3, ia) - rae(3, ib)) < res(3)
@@ -567,10 +627,12 @@ tm1 = median(tm(idx));
 end
 
 %% ═══════════════════════════════════════════════════════════════════════════
-function res = res_params(cfg)
+function [res, protect] = res_params(cfg)
 res = [local_get_cfg(cfg, 'condense_res_range_m', 300), ...
        local_get_cfg(cfg, 'condense_res_az_deg',  0.16), ...
        local_get_cfg(cfg, 'condense_res_el_deg',  0.12)];
+% target_id is evaluation metadata and must never affect preprocessing.
+protect = false;
 end
 
 %% ═══════════════════════════════════════════════════════════════════════════
@@ -603,28 +665,5 @@ if isfield(frame, 'active_t') && numel(frame.active_t) == n
     t = frame.active_t(:).';
 else
     t = frame.t_sec * ones(1, n);
-end
-end
-
-function frames = reconcile_condensed_rae(frames, platform, anchor_ecef, R_anchor)
-for k = 1:numel(frames)
-    M = size(frames(k).active_xyz, 2);
-    if M == 0, continue; end
-    tm = frame_active_times(frames(k), M);
-    for i = 1:M
-        xyz = frames(k).active_xyz(:, i);
-        if ~all(isfinite(xyz)) || ~isfinite(tm(i)), continue; end
-        plat_lat = platform.interp_lat(tm(i));
-        plat_lon = platform.interp_lon(tm(i));
-        plat_alt = platform.interp_alt(tm(i));
-        sensor = R_anchor * ( ...
-            llh_to_ecef(plat_lat, plat_lon, plat_alt) - anchor_ecef);
-        delta = xyz - sensor;
-        range_m = norm(delta);
-        horizontal_m = hypot(delta(1), delta(2));
-        frames(k).active_rae(:, i) = [range_m; ...
-            atan2d(delta(1), delta(2)); ...
-            atan2d(delta(3), max(horizontal_m, realmin))];
-    end
 end
 end

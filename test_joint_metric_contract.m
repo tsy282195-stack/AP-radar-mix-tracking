@@ -46,6 +46,11 @@ assert(after.truth_targets.instance_count == 1);
 assert(b.coverage == 1 && a.coverage == 1 && d.coverage == 1);
 assert(a.n_correct == 10 && d.truth_total == 10 && d.n_labeled_assoc == 10);
 assert(after.three_d.track_accuracy.n_correct_tracks == 1 && d.is_correct);
+distribution = after.three_d.track_accuracy.coverage_distribution;
+assert(distribution.n_tracks == 1 && distribution.mean == 1 && ...
+    distribution.median == 1 && distribution.n_ge_90 == 1 && ...
+    distribution.n_ge_95 == 1 && distribution.n_ge_98 == 1 && ...
+    distribution.n_ge_99 == 1);
 assert(before.two_d.reference.n_passive_to_2d == 10 && after.two_d.reference.n_passive_to_2d == 9);
 assert(after.two_d.track_accuracy.purity == 1);
 assert(after.two_d.output_coverage.n_reference_measurements == 9);
@@ -126,6 +131,11 @@ results.fragment = struct('association_rate', m.association.rate_all_tracks, ...
     'target_presence_coverage', m.real_truth.target_coverage_rate, ...
     'real_position_rmse_m', m.real_truth.position.rmse_3d_m);
 assert(m.track_accuracy.purity == 0.3 && m.track_accuracy.n_correct_tracks == 0);
+distribution = m.track_accuracy.coverage_distribution;
+assert(distribution.n_tracks == 1 && distribution.mean == 0.3 && ...
+    distribution.median == 0.3 && distribution.n_ge_90 == 0 && ...
+    distribution.n_ge_95 == 0 && distribution.n_ge_98 == 0 && ...
+    distribution.n_ge_99 == 0);
 assert(m.real_truth.target_coverage_rate == 1 && m.overall.output_coverage.rate == 0.3);
 short_output = est; short_output.output(1:9) = {[]};
 m = evaluate_joint_tracking_metrics(short_output, events, cfg, platform);
@@ -230,6 +240,9 @@ empty_active = events(1).active;
 empty_active.n_meas = 0; empty_active.t_sec = []; empty_active.ids = [];
 empty_active.has_range = false(1, 0); empty_active.rae = zeros(3, 0);
 empty_active.xyz = zeros(3, 0);
+empty_active.R_ae = zeros(2, 2, 0);
+empty_active.R_xyz = zeros(3, 3, 0);
+empty_active.src = zeros(1, 0);
 for k = 1:10
     events(k).passive = struct('n_meas', 1, 't_sec', k-1, 'ids', 801, ...
         'ang', events(k).active.rae(2:3, :));
@@ -243,6 +256,7 @@ end
 est.assoc(1:5) = {[]}; est.output(1:9) = {[]};
 m = evaluate_joint_tracking_metrics(est, events, cfg);
 assert(m.two_d.track_accuracy.purity == 0.5);
+assert(m.measurement_accounting.passive.utilization_rate == 0.5);
 assert(m.two_d.output_coverage.n_reference_measurements == 10);
 assert(m.two_d.output_coverage.rate == 0.1);
 assert_details_agree(m);

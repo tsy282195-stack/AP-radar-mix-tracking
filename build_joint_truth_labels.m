@@ -9,12 +9,9 @@ labels.passive = cell(K, 1);
 frame_times = nan(K, 1);
 spatial_xyz = cell(K, 1);
 spatial_ids = cell(K, 1);
-n_active = sum(arrayfun(@(e) e.active.n_meas, events));
-n_passive = sum(arrayfun(@(e) e.passive.n_meas, events));
-all_ids = nan(1, n_active + n_passive);
-all_active_ids = nan(1, n_active + n_passive);
-all_passive_ids = nan(1, n_passive);
-p_all = 0; p_active = 0; p_passive = 0;
+all_ids = zeros(1, 0);
+all_active_ids = zeros(1, 0);
+all_passive_ids = zeros(1, 0);
 
 for k = 1:K
     e = events(k);
@@ -26,15 +23,13 @@ for k = 1:K
     passive_kind = sized_row(field_or(e.passive, 'kind', ones(1, np)), np, 1);
     active_angle = passive_kind == 2;
     physical_passive = passive_kind == 1;
-    values = [active_ids(isfinite(active_ids)), passive_ids(isfinite(passive_ids))];
-    ii = p_all + (1:numel(values)); all_ids(ii) = values; p_all = p_all + numel(values);
-    values = [active_ids(isfinite(active_ids)), ...
-        passive_ids(active_angle & isfinite(passive_ids))];
-    ii = p_active + (1:numel(values)); all_active_ids(ii) = values;
-    p_active = p_active + numel(values);
-    values = passive_ids(physical_passive & isfinite(passive_ids));
-    ii = p_passive + (1:numel(values)); all_passive_ids(ii) = values;
-    p_passive = p_passive + numel(values);
+    all_ids = [all_ids, active_ids(isfinite(active_ids)), ... %#ok<AGROW>
+        passive_ids(isfinite(passive_ids))]; %#ok<AGROW>
+    all_active_ids = [all_active_ids, ...
+        active_ids(isfinite(active_ids)), ...
+        passive_ids(active_angle & isfinite(passive_ids))]; %#ok<AGROW>
+    all_passive_ids = [all_passive_ids, ...
+        passive_ids(physical_passive & isfinite(passive_ids))]; %#ok<AGROW>
 
     Z = nan(3, na);
     n_xyz = min(na, size(e.active.xyz, 2));
@@ -47,9 +42,6 @@ for k = 1:K
     spatial_ids{k} = active_ids;
 end
 
-all_ids = all_ids(1:p_all);
-all_active_ids = all_active_ids(1:p_active);
-all_passive_ids = all_passive_ids(1:p_passive);
 all_ids = unique(all_ids(isfinite(all_ids)));
 all_active_ids = unique(all_active_ids(isfinite(all_active_ids)));
 all_passive_ids = unique(all_passive_ids(isfinite(all_passive_ids)));
@@ -365,8 +357,7 @@ else
     active_angle_only_ids = zeros(1, 0);
 end
 summary.enabled = true;
-summary.raw_ids = unique([active_raw_ids, passive_raw_ids]);
-summary.raw_id_count = numel(summary.raw_ids);
+summary.raw_id_count = numel(active_raw_ids) + numel(passive_raw_ids);
 summary.instance_count = reference_info.instance_count + info.n_unmatched_segments;
 % Only active truth has split-instance semantics. Passive observations are
 % segmented solely for geometric mapping and must not inflate split counts.
@@ -382,6 +373,7 @@ summary.n_spatial_raw_ids = numel(spatial_raw_ids);
 summary.n_active_angle_only_raw_ids = numel(active_angle_only_ids);
 summary.n_angle_only_raw_ids = numel(active_angle_only_ids) + ...
     numel(unique(info.unmatched_raw_ids));
+summary.raw_ids = [active_raw_ids, passive_raw_ids];
 summary.spatial_raw_ids = spatial_raw_ids;
 summary.angle_only_raw_ids = [active_angle_only_ids, ...
     unique(info.unmatched_raw_ids)];
@@ -460,79 +452,60 @@ end
 end
 
 function raw_ids = collect_spatial_raw_ids(ids, xyz)
-n_total = sum(cellfun(@(x) size(x, 2), xyz));
-raw_ids = nan(1, n_total); p = 0;
+raw_ids = zeros(1, 0);
 for k = 1:numel(ids)
     id = sized_row(ids{k}, size(xyz{k}, 2), NaN);
     good = isfinite(id) & all(isfinite(xyz{k}), 1);
-    values = id(good); ii = p + (1:numel(values));
-    raw_ids(ii) = values; p = p + numel(values);
+    raw_ids = [raw_ids, id(good)]; %#ok<AGROW>
 end
-raw_ids = unique(raw_ids(1:p));
+raw_ids = unique(raw_ids);
 end
 
 function [ref_time, ref_angle] = collect_spatial_references(events, split_labels, n_key)
 ref_time = cell(1, n_key);
 ref_angle = cell(1, n_key);
-n_total = sum(arrayfun(@(e) e.active.n_meas, events));
-all_key = nan(1, n_total); all_time = nan(1, n_total);
-all_angle = nan(2, n_total); p = 0;
 for k = 1:numel(events)
     e = events(k);
     na = e.active.n_meas;
     keys = sized_row(split_labels{k}, na, NaN);
     times = measurement_times(e.active.t_sec, na, e.t_sec);
     angles = sized_matrix(e.active.rae, 2:3, na);
-    ii = p + (1:na); all_key(ii) = keys; all_time(ii) = times;
-    all_angle(:, ii) = angles; p = p + na;
+    for j = find(isfinite(keys) & keys >= 1 & keys <= n_key)
+        key = round(keys(j));
+        ref_time{key}(end + 1) = times(j);
+        ref_angle{key}(:, end + 1) = angles(:, j);
+    end
 end
-[ref_time, ref_angle] = records_to_references( ...
-    all_key(1:p), all_time(1:p), all_angle(:, 1:p), n_key);
+for key = 1:n_key
+    good = isfinite(ref_time{key}) & all(isfinite(ref_angle{key}), 1);
+    ref_time{key} = ref_time{key}(good);
+    ref_angle{key} = ref_angle{key}(:, good);
+    [ref_time{key}, order] = sort(ref_time{key});
+    ref_angle{key} = ref_angle{key}(:, order);
+end
 end
 
 function [ref_time, ref_angle] = collect_active_references( ...
         events, active_labels, active_angle_labels, n_key)
 [ref_time, ref_angle] = collect_spatial_references(events, active_labels, n_key);
-n_total = sum(arrayfun(@(e) e.passive.n_meas, events));
-all_key = nan(1, n_total); all_time = nan(1, n_total);
-all_angle = nan(2, n_total); p = 0;
 for k = 1:numel(events)
     e = events(k); n = e.passive.n_meas;
     keys = sized_row(active_angle_labels{k}, n, NaN);
     times = measurement_times(e.passive.t_sec, n, e.t_sec);
     angles = sized_matrix(e.passive.ang, 1:2, n);
     kind = sized_row(field_or(e.passive, 'kind', ones(1, n)), n, 1);
-    use = kind == 2; count = nnz(use); ii = p + (1:count);
-    all_key(ii) = keys(use); all_time(ii) = times(use);
-    all_angle(:, ii) = angles(:, use); p = p + count;
+    for j = find(kind == 2 & isfinite(keys) & keys >= 1 & keys <= n_key)
+        key = round(keys(j));
+        ref_time{key}(end + 1) = times(j);
+        ref_angle{key}(:, end + 1) = angles(:, j);
+    end
 end
-all_key = all_key(1:p); all_time = all_time(1:p); all_angle = all_angle(:, 1:p);
-valid = isfinite(all_key) & all_key >= 1 & all_key <= n_key & ...
-    isfinite(all_time) & all(isfinite(all_angle), 1);
-all_key = round(all_key(valid)); all_time = all_time(valid);
-all_angle = all_angle(:, valid);
 for key = 1:n_key
-    add = find(all_key == key);
-    if isempty(add), continue; end
-    time = [ref_time{key}, all_time(add)];
-    angle = [ref_angle{key}, all_angle(:, add)];
-    [ref_time{key}, order] = sort(time);
-    ref_angle{key} = angle(:, order);
-end
-end
-
-function [ref_time, ref_angle] = records_to_references(keys, times, angles, n_key)
-ref_time = cell(1, n_key); ref_angle = cell(1, n_key);
-valid = isfinite(keys) & keys >= 1 & keys <= n_key & isfinite(times) & ...
-    all(isfinite(angles), 1);
-keys = round(keys(valid)); times = times(valid); angles = angles(:, valid);
-if isempty(keys), return; end
-[~, order] = sortrows([keys(:), times(:)], [1, 2]);
-keys = keys(order); times = times(order); angles = angles(:, order);
-edge = [1, find(diff(keys) ~= 0) + 1, numel(keys) + 1];
-for q = 1:numel(edge) - 1
-    ii = edge(q):edge(q + 1) - 1; key = keys(ii(1));
-    ref_time{key} = times(ii); ref_angle{key} = angles(:, ii);
+    good = isfinite(ref_time{key}) & all(isfinite(ref_angle{key}), 1);
+    ref_time{key} = ref_time{key}(good);
+    ref_angle{key} = ref_angle{key}(:, good);
+    [ref_time{key}, order] = sort(ref_time{key});
+    ref_angle{key} = ref_angle{key}(:, order);
 end
 end
 

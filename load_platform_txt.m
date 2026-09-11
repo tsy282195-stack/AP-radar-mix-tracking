@@ -15,11 +15,12 @@ function platform = load_platform_txt(filepath, cfg)
 
 c = cfg.platform;
 max_extrapolation_s = 0.1;
-if isfield(cfg, 'platform_max_extrapolation_s') && ~isempty(cfg.platform_max_extrapolation_s)
+if isfield(cfg, 'platform_max_extrapolation_s') && ...
+        ~isempty(cfg.platform_max_extrapolation_s)
     max_extrapolation_s = cfg.platform_max_extrapolation_s;
 end
-if ~isnumeric(max_extrapolation_s) || ~isreal(max_extrapolation_s) || ...
-        ~isscalar(max_extrapolation_s) || ~isfinite(max_extrapolation_s) || max_extrapolation_s < 0
+if ~isscalar(max_extrapolation_s) || ~isfinite(max_extrapolation_s) || ...
+        max_extrapolation_s < 0
     error('load_platform_txt:InvalidExtrapolationLimit', ...
         'cfg.platform_max_extrapolation_s must be a finite nonnegative scalar.');
 end
@@ -36,15 +37,12 @@ if fid < 0, error('无法打开平台文件: %s', filepath); end
 
 %% ── 第一遍：统计数据行数 ────────────────────────────────────────────────
 total_rows = 0;
-previous_row_time = NaN; day_offset = 0;
 while ~feof(fid)
     line = fgetl(fid);
     if ischar(line) && ~isempty(strtrim(line))
         parts = split_line_auto(strtrim(line), cfg);
         if is_platform_data_row(parts, c)
             t_row = parse_time_str(strtrim(parts{c.time_col}), c.time_format);
-            [t_row, previous_row_time, day_offset] = unwrap_fusion_clock_sample( ...
-                t_row, previous_row_time, day_offset, c.time_format);
             if within_time_range(t_row, cfg)
                 total_rows = total_rows + 1;
             end
@@ -68,7 +66,6 @@ n_rows  = 0;
 data_row_count = 0;
 has_header = false;
 seen_first_nonempty = false;
-previous_row_time = NaN; day_offset = 0;
 
 while ~feof(fid)
     line = fgetl(fid);
@@ -91,8 +88,6 @@ while ~feof(fid)
 
     % 解析时间
     t_row = parse_time_str(strtrim(parts{c.time_col}), c.time_format);
-    [t_row, previous_row_time, day_offset] = unwrap_fusion_clock_sample( ...
-        t_row, previous_row_time, day_offset, c.time_format);
     if isnan(t_row), continue; end
 
     % 解析经纬高
@@ -100,12 +95,7 @@ while ~feof(fid)
     lon_v = str2double(strtrim(parts{c.lon_col}));
     alt_v = str2double(strtrim(parts{c.alt_col}));
 
-    lat_out = lat_v * ang_scale;
-    lon_out = lon_v * ang_scale;
-    if any(~isfinite([lat_out, lon_out, alt_v])) || ...
-            abs(lat_out) > 90 || abs(lon_out) > 180
-        continue;
-    end
+    if any(isnan([lat_v, lon_v, alt_v])), continue; end
 
     if ~within_time_range(t_row, cfg)
         continue;
@@ -116,8 +106,8 @@ while ~feof(fid)
 
     n_rows = n_rows + 1;
     t_sec(n_rows)   = t_row;
-    lat_deg(n_rows) = lat_out;
-    lon_deg(n_rows) = lon_out;
+    lat_deg(n_rows) = lat_v * ang_scale;
+    lon_deg(n_rows) = lon_v * ang_scale;
     alt_m(n_rows)   = alt_v;
 end
 fclose(fid);
@@ -165,14 +155,14 @@ if n_rows > 0
         fprintf('  时间: %.3f ~ %.3f s, 采样间隔中位数=%.4f s (%.1f Hz)\n', ...
             min(t_sec), max(t_sec), dt_median, 1/dt_median);
     else
-        fprintf('  时间: %.3f s, 仅1条平台记录，仅支持该时刻查询\n', t_sec(1));
+        fprintf('  时间: %.3f s, 仅1条平台记录，插值将使用常值\n', t_sec(1));
     end
     fprintf('  纬度: %.4f~%.4f deg, 经度: %.4f~%.4f deg, 高度: %.0f~%.0f m\n', ...
         min(lat_deg), max(lat_deg), min(lon_deg), max(lon_deg), min(alt_m), max(alt_m));
 end
 
 %% ── 构建插值函数句柄 ──────────────────────────────────────────────────
-% Bound endpoint extrapolation by both time and the observed sampling period.
+% 端点外只允许很短的线性外推；超限直接报错，避免静默钳位制造假几何。
 if n_rows > 1
     max_extrapolation_s = min(max_extrapolation_s, median(diff(t_sec)));
 else
@@ -187,7 +177,21 @@ end
 
 %% ═══════════════════════════════════════════════════════════════════════════
 function t_sec = parse_time_str(t_str, fmt)
-t_sec = parse_fusion_time(t_str, fmt);
+t_str = strtrim(char(t_str));
+t_str = strrep(t_str, char(65279), '');
+if isempty(t_str), t_sec = NaN; return; end
+t_num = str2double(t_str);
+if ~isnan(t_num), t_sec = t_num; return; end
+switch lower(fmt)
+    case 'hms'
+        parts = strsplit(t_str, ':');
+        if numel(parts) < 3, t_sec = NaN; return; end
+        h = str2double(parts{1}); m = str2double(parts{2}); s = str2double(parts{3});
+        if any(isnan([h, m, s])), t_sec = NaN; return; end
+        t_sec = h * 3600 + m * 60 + s;
+    otherwise
+        t_sec = str2double(t_str);
+end
 end
 
 %% ═══════════════════════════════════════════════════════════════════════════
@@ -197,9 +201,11 @@ if isempty(xi)
     return;
 end
 if any(~isfinite(xi(:)))
-    error('load_platform_txt:InvalidQueryTime', 'Platform query times must be finite.');
+    error('load_platform_txt:InvalidQueryTime', ...
+        'Platform query times must be finite.');
 end
-if any(xi(:) < x(1) - limit_s - 1e-9 | xi(:) > x(end) + limit_s + 1e-9)
+if any(xi(:) < x(1) - limit_s - 1e-9 | ...
+        xi(:) > x(end) + limit_s + 1e-9)
     error('load_platform_txt:PlatformTimeCoverage', ...
         ['平台时间范围[%.6f, %.6f]未覆盖查询范围[%.6f, %.6f]，' ...
          '已超过允许的端点线性外推上限 %.6f s。'], ...

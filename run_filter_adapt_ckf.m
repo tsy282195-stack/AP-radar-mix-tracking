@@ -11,21 +11,14 @@ function est = run_filter_adapt_ckf(fused_xyz, fused_R, frame_times, cfg, passiv
 %    - 按位置去重(零速新生可并入运动航迹)；
 %    - 确认权重地板 + 命中增益。
 %
-%  本版新增的两项改进（均带 on/off 句柄，缺省可不改 config 直接运行）：
+%  本版新增的改进（带 on/off 句柄，缺省可不改 config 直接运行）：
 %    A) 滑窗累积速度趋势（vel_trend_*）：密集且高噪声量测下，单帧滤波速度抖动大。
 %       为每条航迹维护“位置-时间”滑窗，用最小二乘拟合得到该段航迹的累积速度
 %       (大小+方向)作为速度趋势，在预测步按比例替代/融合状态速度来外推位置，
 %       不再单纯依赖上一帧的瞬时速度估计。开关 cfg.vel_trend_enabled。
-%    B) 目标关联编号辅助先验（use_target_id_prior）：把主动目标编号作为软先验，
-%       量测编号与航迹学到的“主导编号”一致时在关联代价上给折扣。
-%       重要：数据中的编号可能重复(两个不同目标却同号)，故内置歧义判别——
-%       同一帧内若同一编号的量测在空间上分裂为多簇(间距 > id_dup_dist_m)，
-%       则该编号本帧判为歧义、不施加先验，也不更新航迹↔编号绑定，避免误并。
-%       该先验为对称软约束(两条共享同号的航迹都得到等折扣→相互抵消)，
-%       因此始终由运动学主导，编号仅在能区分时起到“破平”作用。
 %
 %  其余管理升级（上一版已含）：交叉保护去重、NIS一致性监控、滑行阻尼、
-%    两点速度初始化、权重语义统一、确认只计真实关联(S==1)。
+%    两点速度初始化、权重语义统一；主动命中和成组被动等效命中分别记为S=1/4。
 %
 %  Output:
 %    est : 结构体
@@ -34,7 +27,7 @@ function est = run_filter_adapt_ckf(fused_xyz, fused_R, frame_times, cfg, passiv
 %      .N(k)        确认航迹数
 %      .L{k}        航迹标签 [出生帧; ID]
 %      .tracks{k}   所有航迹信息（含未确认）
-%      .passive_bearing_stats  被动角度输入、融合、拒绝及节流统计
+%      .passive_bearing_stats  被动角度输入、关联、拒绝及节流统计
 %      .track_timeout_stats    秒级最长等待期删除统计与逐航迹记录
 %      .birth_stats            普通/冲突候选的出生、确认与删除统计
 %      .active_assoc_stats     分层主关联、二次分配和次回波诊断统计
@@ -50,7 +43,7 @@ if nargin < 6
     platform = [];
 end
 if nargin < 7 || isempty(fused_ids)
-    fused_ids = cell(K, 1);   % 未提供编号 → 编号先验自动关闭
+    fused_ids = cell(K, 1);   % 未提供编号时，评价关联字段保持NaN
 end
 if nargin < 8 || isempty(event_meta)
     event_meta = default_event_meta(K);
@@ -66,9 +59,11 @@ fprintf('帧数: %d, 状态维数: %d (CA)\n', K, x_dim);
 
 if K == 0
     est.X = {}; est.P = {}; est.N = []; est.L = {}; est.tracks = {}; est.assoc = {};
+    est.passive_assoc = {};
     est.gate = {}; est.gate_gamma = cfg.gating_gamma;
     est.timing = struct('predict', 0, 'update', 0, 'manage', 0, 'total', 0);
     est.passive_bearing_stats = empty_passive_bearing_stats();
+    est.passive_bearing_stats.n_equivalent_confirm_hits = 0;
     est.track_timeout_stats = make_track_timeout_stats( ...
         get_cfg_field(cfg, 'track_timeout_enabled', true) ~= 0, ...
         get_cfg_field(cfg, 'tentative_max_silence_s', 2), ...
@@ -80,6 +75,9 @@ if K == 0
     est.end_of_stream = make_end_of_stream_status(trk_init(x_dim), NaN, ...
         get_cfg_field(cfg, 'tentative_max_silence_s', 2), ...
         get_cfg_field(cfg, 'confirmed_max_silence_s', 6));
+    est.output_freshness = struct('max_silence_s', ...
+        get_cfg_field(cfg, 'confirmed_output_max_silence_s', 0.5), ...
+        'n_suppressed', 0);
     fprintf('无帧数据，跳过滤波。\n');
     return;
 end
@@ -104,6 +102,8 @@ tent_max_miss    = get_cfg_field(cfg, 'tentative_max_miss',     4);
 track_timeout_enabled = get_cfg_field(cfg, 'track_timeout_enabled', true) ~= 0;
 tentative_max_silence_s = get_cfg_field(cfg, 'tentative_max_silence_s', 2);
 confirmed_max_silence_s = get_cfg_field(cfg, 'confirmed_max_silence_s', 6);
+confirmed_output_max_silence_s = get_cfg_field(cfg, ...
+    'confirmed_output_max_silence_s', 0.5);
 confirmed_time_authoritative = track_timeout_enabled && isfinite(confirmed_max_silence_s);
 w_floor_conf     = get_cfg_field(cfg, 'weight_floor_confirmed', 0.6);
 hit_gain         = get_cfg_field(cfg, 'hit_weight_gain',        0.2);
@@ -116,11 +116,13 @@ passive_bearing_update_on_active = get_cfg_field(cfg, 'passive_bearing_update_on
 passive_bearing_update_on_pure = get_cfg_field(cfg, 'passive_bearing_update_on_pure', true) ~= 0;
 passive_bearing_update_active_hit_tracks = get_cfg_field(cfg, 'passive_bearing_update_active_hit_tracks', false) ~= 0;
 passive_bearing_min_dt_s = get_cfg_field(cfg, 'passive_bearing_min_dt_s', 0.10);
-passive_bearing_fast_gate_deg = get_cfg_field(cfg, 'passive_bearing_fast_gate_deg', 2.0);
-passive_meas_fuse_enabled = get_cfg_field(cfg, 'passive_meas_fuse_enabled', true) ~= 0;
-passive_meas_fuse_weight = get_cfg_text_field(cfg, 'passive_meas_fuse_weight', 'likelihood');
-passive_meas_fuse_max_count = max(1, round(get_cfg_field(cfg, 'passive_meas_fuse_max_count', 4)));
-passive_meas_fuse_max_spread_deg = get_cfg_field(cfg, 'passive_meas_fuse_max_spread_deg', 0.35);
+passive_bearing_fast_gate_deg = get_cfg_finite_or_posinf_field( ...
+    cfg, 'passive_bearing_fast_gate_deg', 2.0);
+joint_extension_enabled = get_cfg_field(cfg, 'joint_extension_enabled', false) ~= 0;
+joint_passive_confirm_hits = max(1, round(get_cfg_field(cfg, ...
+    'joint_passive_confirm_consecutive_hits', 3)));
+joint_passive_confirm_max_gap_s = get_cfg_field(cfg, ...
+    'joint_passive_confirm_max_gap_s', 0.20);
 
 % 管理升级参数
 coast_acc_decay  = get_cfg_field(cfg, 'coast_acc_decay',        0.6);  % 滑行加速度衰减
@@ -156,14 +158,7 @@ vel_trend_blend     = min(max(get_cfg_field(cfg, 'vel_trend_blend',  0.7), 0), 1
 vel_trend_min_speed = get_cfg_field(cfg, 'vel_trend_min_speed',  20);   % 低于此速度不施加趋势(避免给静止/慢目标硬塞方向)
 vel_trend_conf_only = get_cfg_field(cfg, 'vel_trend_conf_only',  false) ~= 0;        % 仅对确认航迹施加
 
-% ── 改进B：目标关联编号辅助先验（软先验 + 重复编号歧义判别）──
-id_prior_enabled = get_cfg_field(cfg, 'use_target_id_prior',  true) ~= 0;
-id_cost_bonus    = get_cfg_field(cfg, 'id_prior_cost_bonus',  8);     % 编号一致时关联代价折扣(从cost中减去)
-id_dup_dist_m    = get_cfg_field(cfg, 'id_dup_dist_m',        800);   % 同帧同编号量测的去重簇间距门(超过判为不同目标)
-id_min_conf      = get_cfg_field(cfg, 'id_prior_min_conf',    3);     % 航迹↔编号绑定达到此置信度才启用先验
-id_conf_max      = get_cfg_field(cfg, 'id_prior_conf_max',    20);    % 绑定置信度上限(防过度黏滞)
-
-% ── 改进C：CA+CV 等维 IMM 多模型（模型1=CV, 模型2=CA）──
+% ── 改进B：CA+CV 等维 IMM 多模型（模型1=CV, 模型2=CA）──
 %  组合估计写回 trk.m/trk.P，所有现有管理逻辑(门控/关联/去重/NIS/输出)无感；
 %  模型条件状态存于 trk.imm{i}=struct('x'[9×2],'P'[9×9×2],'mu'[2×1])。
 %  自适应R：与模型无关，各模型共享每航迹的自适应R；自适应Q：CA用CS自适应Q,
@@ -194,10 +189,6 @@ if vel_trend_enabled
     fprintf('滑窗速度趋势: 窗=%d样本/≥%.2fs, 最小样本=%d, 替代比例=%.2f, 最小速度=%.0fm/s%s\n', ...
         vel_trend_window, vel_trend_span_s, vel_trend_min_n, vel_trend_blend, vel_trend_min_speed, vt_scope);
 end
-if id_prior_enabled
-    fprintf('编号辅助先验: 代价折扣=%.1f, 重复编号去重簇门=%.0fm, 绑定置信≥%d启用(上限%d)\n', ...
-        id_cost_bonus, id_dup_dist_m, id_min_conf, id_conf_max);
-end
 if use_imm
     fprintf('IMM多模型: CV+CA, TPM自保持=[CV %.2f, CA %.2f], 新生CV先验=%.2f, CV过程噪声σa=%.1f\n', ...
         imm_p_cv_stay, imm_p_ca_stay, imm_mu_init_cv, get_cfg_field(cfg, 'imm_cv_sigma_a', 3));
@@ -209,9 +200,8 @@ if passive_bearing_enabled
         passive_bearing_update_on_active, passive_bearing_update_on_pure, ...
         passive_bearing_update_active_hit_tracks, passive_bearing_min_dt_s, ...
         passive_bearing_fast_gate_deg);
-    fprintf('passive same-source fusion: enabled=%d, weight=%s, max_count=%d, max_spread=%.2fdeg\n', ...
-        passive_meas_fuse_enabled, passive_meas_fuse_weight, ...
-        passive_meas_fuse_max_count, passive_meas_fuse_max_spread_deg);
+    fprintf(['passive timing: bounded event batches; raw timestamps retained upstream; ' ...
+        'TXT shards share one physical source\n']);
 end
 
 % H矩阵（提取XYZ位置）
@@ -235,6 +225,17 @@ est.gate_gamma = gamma_gate;   % 卡方门限；门椭球马氏半径 = sqrt(gam
 est.timing = struct('predict', 0, 'update', 0, 'manage', 0);
 est.event_meta = event_meta;
 est.filter_times = frame_times(:);
+est.passive_assoc = cell(K, 1);
+if joint_extension_enabled
+    joint2d_cfg = make_online_joint2d_cfg(cfg, frame_times, passive_bearing);
+    joint2d_state = [];
+    est.joint2d = init_online_joint2d_estimate(K, frame_times);
+    fprintf('  Joint online residual-angle branch: enabled (single causal pass).\n');
+else
+    joint2d_cfg = struct();
+    joint2d_state = [];
+    est.joint2d = [];
+end
 
 %% ── 航迹集合（结构体形式，统一管理所有逐航迹属性） ────────────────────
 trk = trk_init(x_dim);
@@ -243,6 +244,9 @@ prev_t  = frame_times(1);
 n_passive_bearing_used_total = 0;
 n_passive_bearing_skipped_total = 0;
 passive_bearing_stats = empty_passive_bearing_stats();
+passive_confirm_state = empty_passive_confirm_state();
+passive_equivalent_hits_total = 0;
+last_passive_bearing_t = -inf;
 n_birth_total = 0;
 n_birth_suppressed_gated = 0;
 n_birth_suppressed_guard = 0;
@@ -251,6 +255,7 @@ n_secondary_fused_total = 0;
 n_secondary_released_total = 0;
 n_timeout_tentative_total = 0;
 n_timeout_confirmed_total = 0;
+n_output_stale_suppressed = 0;
 timeout_records = empty_track_timeout_records();
 birth_stats = empty_active_birth_stats();
 active_assoc_stats = empty_active_assoc_stats();
@@ -276,6 +281,7 @@ for k = 1:K
     meta_k = get_event_meta(event_meta, k, M);
     count_miss_cycle = meta_k.miss_cycle;
     count_confirm_cycle = meta_k.confirm_cycle;
+    passive_detail_k = empty_passive_assoc_detail(get_passive_count(passive_bearing, k));
 
     % 本帧融合量测的目标关联编号(与 z_k 列对齐)；缺失 → 全 NaN
     if k <= numel(fused_ids) && ~isempty(fused_ids{k})
@@ -287,14 +293,6 @@ for k = 1:K
         end
     else
         ids_k = nan(1, M);
-    end
-
-    if id_prior_enabled
-        % 重复编号歧义判别：同一编号的量测若在空间上分裂为多簇(间距>门限)，
-        % 说明该编号本帧覆盖了≥2个不同目标，标记为歧义，先验对其失效。
-        amb_orig = detect_ambiguous_ids(z_k, ids_k, id_dup_dist_m);
-    else
-        amb_orig = false(1, M);
     end
 
     % 秒级最长等待期在关联前执行：超过期限的旧航迹不能被迟到量测复活。
@@ -374,7 +372,7 @@ for k = 1:K
         coasting = trk.miss >= 1;
 
         if use_imm
-            % ── 改进C：IMM 预测（交互混合 + 各模型预测 + 组合）──
+            % ── 改进B：IMM 预测（交互混合 + 各模型预测 + 组合）──
             m_pred = zeros(x_dim, trk.N);
             P_pred = zeros(x_dim, x_dim, trk.N);
             pred_imm = cell(1, trk.N);
@@ -527,27 +525,6 @@ for k = 1:K
             nnz(isfinite(nis_mat) & nis_mat > assoc_accept_nis);
         cost_mat(nis_mat > assoc_accept_nis) = inf;
 
-        % ── 改进B：目标关联编号辅助先验（软折扣）──
-        % 对“量测编号 == 航迹学到的主导编号”的配对，从关联代价中减去 id_cost_bonus。
-        % 跳过歧义编号(同帧同号分裂为多簇)。该折扣对称：两条共享同号的航迹都获折扣，
-        % 相互抵消，故仅在编号能区分目标时起破平作用，运动学始终主导。
-        if id_prior_enabled
-            for i = 1:pred.N
-                ti_id = pred.tid(i);
-                if ~isfinite(ti_id) || pred.tid_conf(i) < id_min_conf
-                    continue;
-                end
-                for mi = 1:Mg
-                    orig_mi = gated_idx(mi);
-                    g = ids_k(orig_mi);
-                    if isfinite(g) && ~amb_orig(orig_mi) && g == ti_id && ...
-                            isfinite(cost_mat(i, mi))
-                        cost_mat(i, mi) = max(0, cost_mat(i, mi) - id_cost_bonus);
-                    end
-                end
-            end
-        end
-
         % Confirmed tracks own the first association opportunity.  Ordinary
         % tentative tracks use only confirmed leftovers; conflict-born
         % tentative tracks are last and therefore cannot steal a primary
@@ -563,9 +540,8 @@ for k = 1:K
             if meas_fuse_enabled && ~isempty(added_tracks)
                 [track_meas, available_meas, failed_mi, failed_parent, pair_nis_used, pair_dist_used] = ...
                     attach_secondary_tier(track_meas, available_meas, added_tracks, ...
-                    nis_mat, z_gated, gated_idx, R_k_meas, R_default, ids_k, amb_orig, ...
-                    assoc_accept_nis, meas_fuse_cluster_gamma, meas_fuse_cluster_dist_m, ...
-                    id_prior_enabled);
+                    nis_mat, z_gated, gated_idx, R_k_meas, R_default, ...
+                    assoc_accept_nis, meas_fuse_cluster_gamma, meas_fuse_cluster_dist_m);
                 active_assoc_stats.secondary_pair_nis = ...
                     [active_assoc_stats.secondary_pair_nis, pair_nis_used]; %#ok<AGROW>
                 active_assoc_stats.secondary_pair_dist_m = ...
@@ -626,9 +602,8 @@ for k = 1:K
                 if meas_fuse_enabled && ~isempty(retry_tracks)
                     [track_meas, available_meas, failed_mi, failed_parent, pair_nis_used, pair_dist_used] = ...
                         attach_secondary_tier(track_meas, available_meas, retry_tracks, ...
-                        nis_mat, z_gated, gated_idx, R_k_meas, R_default, ids_k, amb_orig, ...
-                        assoc_accept_nis, meas_fuse_cluster_gamma, meas_fuse_cluster_dist_m, ...
-                        id_prior_enabled);
+                        nis_mat, z_gated, gated_idx, R_k_meas, R_default, ...
+                        assoc_accept_nis, meas_fuse_cluster_gamma, meas_fuse_cluster_dist_m);
                     active_assoc_stats.secondary_pair_nis = ...
                         [active_assoc_stats.secondary_pair_nis, pair_nis_used]; %#ok<AGROW>
                     active_assoc_stats.secondary_pair_dist_m = ...
@@ -711,9 +686,18 @@ for k = 1:K
         trk.nisbad = trk.nisbad + nis_reject_track_count;
     end
     assigned_orig_idx = [];
+    assoc_meas_idx = zeros(1, 0);
     assoc_ids = zeros(1, 0);   % 本帧量测归属（A方案，供回放选择性绘制）
+    % Diagnostics-only action label.  This does not participate in gating,
+    % assignment, filtering or lifecycle decisions; it lets the outer joint
+    % adapter distinguish an accepted update from a birth without inference.
+    assoc_type = cell(1, 0);
     assoc_xyz = zeros(3, 0);
     assoc_tid = zeros(1, 0);
+    assoc_innovation = zeros(z_dim, 0);
+    assoc_nis = zeros(1, 0);
+    assoc_group_size = zeros(1, 0);
+    assoc_innovation_kind = zeros(1, 0); % 0=无, 1=角度deg, 2=位置m
 
     if trk.N > 0
         if count_miss_cycle
@@ -789,7 +773,7 @@ for k = 1:K
 
         % CKF更新（用稳健化后的R）
         if use_imm
-            % ── 改进C：IMM 各模型更新 + 模型概率更新 + 组合 ──
+            % ── 改进B：IMM 各模型更新 + 模型概率更新 + 组合 ──
             [bu, m_upd, P_upd] = imm_update_bank(pred.imm{ti}, z_bar, pos_idx, R_upd);
             trk.imm{ti} = bu;
         else
@@ -813,6 +797,7 @@ for k = 1:K
         trk.S(end, ti)  = 1;
         trk.last_active_hit_t(ti) = t_k;
         trk.last_update_t(ti) = t_k;
+        trk.last_active_nis_norm(ti) = nis / z_dim;
         if ti <= numel(active_hit_mask)
             active_hit_mask(ti) = true;
         end
@@ -862,21 +847,17 @@ for k = 1:K
         trk.poshist{ti} = push_poshist(trk.poshist{ti}, t_k, trk.m(pos_idx, ti), ...
                                        vel_trend_window);
 
-        if id_prior_enabled
-            cand = ids_k(orig);
-            cand = cand(isfinite(cand) & ~amb_orig(orig));
-            if ~isempty(cand)
-                assoc_id = mode(cand);
-                [trk.tid(ti), trk.tid_conf(ti)] = vote_tid( ...
-                    trk.tid(ti), trk.tid_conf(ti), assoc_id, id_conf_max);
-            end
-        end
-
         for jj = 1:nJ
             assigned_orig_idx(end+1) = orig(jj);
+            assoc_meas_idx(end+1) = orig(jj);
             assoc_ids(end+1) = trk.L(2, ti);
+            assoc_type{end+1} = 'active';                  %#ok<AGROW>
             assoc_xyz(:, end+1) = Z(:, jj);
             assoc_tid(end+1) = ids_k(orig(jj));
+            assoc_innovation(:, end+1) = innovation;
+            assoc_nis(end+1) = nis;
+            assoc_group_size(end+1) = nJ;
+            assoc_innovation_kind(end+1) = 2;
         end
     end
 
@@ -945,6 +926,7 @@ for k = 1:K
         b.miss = zeros(1, N_birth);
         b.age  = ones(1, N_birth);
         b.nisbad = zeros(1, N_birth);
+        b.last_active_nis_norm = nan(1, N_birth);
         b.born_xyz = z_k(:, unassoc_idx);
         b.born_t = t_k * ones(1, N_birth);
         b.last_active_hit_t = t_k * ones(1, N_birth);
@@ -954,8 +936,6 @@ for k = 1:K
         b.parent_id = meas_parent_id(unassoc_idx);
         b.vinit = zeros(1, N_birth);
         b.poshist = cell(1, N_birth);
-        b.tid = nan(1, N_birth);
-        b.tid_conf = zeros(1, N_birth);
         b.imm = cell(1, N_birth);
         b.N = N_birth;
 
@@ -968,18 +948,19 @@ for k = 1:K
                 next_id, t_k, b.birth_kind(bb), b.parent_id(bb), oid); %#ok<AGROW>
             % 记录新生种子量测归属于此新ID
             assoc_ids(end+1) = next_id;                    %#ok<AGROW>
+            assoc_type{end+1} = 'active_birth';            %#ok<AGROW>
+            assoc_meas_idx(end+1) = oid;                   %#ok<AGROW>
             assoc_xyz(:, end+1) = z_k(:, oid);             %#ok<AGROW>
             assoc_tid(end+1) = ids_k(oid);                 %#ok<AGROW>
+            assoc_innovation(:, end+1) = nan(z_dim, 1);    %#ok<AGROW>
+            assoc_nis(end+1) = NaN;                        %#ok<AGROW>
+            assoc_group_size(end+1) = 1;                   %#ok<AGROW>
+            assoc_innovation_kind(end+1) = 0;              %#ok<AGROW>
             next_id = next_id + 1;
             b.innov{bb} = zeros(z_dim, 0);
             b.R{bb} = get_meas_R(R_k_meas, oid, R_default);
             % 滑窗种子：出生点(t, xyz)
             b.poshist{bb} = [t_k; z_k(:, oid)];
-            % 编号绑定种子：用出生量测的编号(非歧义时)给一次初始投票
-            if id_prior_enabled && isfinite(ids_k(oid)) && ~amb_orig(oid)
-                b.tid(bb) = ids_k(oid);
-                b.tid_conf(bb) = 1;
-            end
             % IMM bank 种子：两模型均置于出生态，模型概率 [CV; CA]
             if use_imm
                 b.imm{bb} = imm_init_bank(b.m(:, bb), P_birth, imm_mu_init_cv, imm_n_models);
@@ -1005,32 +986,31 @@ for k = 1:K
             else
                 allow_by_type = (meta_k.has_active && passive_bearing_update_on_active) || ...
                     (~meta_k.has_active && passive_bearing_update_on_pure);
+                allow_existing_by_dt = passive_bearing_min_dt_s <= 0 || ...
+                    (t_k - last_passive_bearing_t) >= passive_bearing_min_dt_s;
                 allow_newborn_same_event = meta_k.has_active && N_birth > 0 && ...
                     passive_bearing_update_on_active;
-                pb_track_mask = false(1, trk.N);
-                n_existing = min(pred.N, trk.N);
-                if n_existing > 0
-                    last_pb = trk.last_passive_update_t(1:n_existing);
-                    pb_track_mask(1:n_existing) = (passive_bearing_min_dt_s <= 0) | ...
-                        ~isfinite(last_pb) | ...
-                        (t_k - last_pb) >= passive_bearing_min_dt_s;
-                end
-                if allow_newborn_same_event && trk.N > n_existing
-                    pb_track_mask(n_existing + 1:end) = true;
-                end
-                if allow_by_type && any(pb_track_mask)
+                if allow_by_type && (allow_existing_by_dt || allow_newborn_same_event)
+                    pb_track_mask = true(1, trk.N);
+                    if ~allow_existing_by_dt
+                        % 节流期只放行本拍新生，旧航迹仍遵守全局被动更新时间间隔。
+                        n_existing = min(pred.N, trk.N);
+                        if n_existing > 0
+                            pb_track_mask(1:n_existing) = false;
+                        end
+                    end
                     if ~passive_bearing_update_active_hit_tracks && ~isempty(active_hit_mask)
-                        % Existing tracks hit by active measurements in this
-                        % event are excluded, independently per track.
-                        n_hit = min([pred.N, numel(active_hit_mask), trk.N]);
-                        if n_hit > 0
-                            pb_track_mask(1:n_hit) = pb_track_mask(1:n_hit) & ...
-                                ~active_hit_mask(1:n_hit);
+                        % 旧航迹继续遵守“本拍主动命中后不重复做被动更新”；
+                        % 本拍刚出生的航迹没有经过主动滤波更新，保持 eligible=true。
+                        n_existing = min([pred.N, numel(active_hit_mask), trk.N]);
+                        if n_existing > 0
+                            pb_track_mask(1:n_existing) = pb_track_mask(1:n_existing) & ...
+                                ~active_hit_mask(1:n_existing);
                         end
                     end
                     if any(pb_track_mask)
                         if use_imm, m_before_pb = trk.m; end
-                        [trk, n_pb_used, pb_stats_k] = update_passive_bearing(trk, pb_k, t_k, platform, cfg, ...
+                        [trk, n_pb_used, pb_stats_k, passive_detail_k] = update_passive_bearing(trk, pb_k, t_k, platform, cfg, ...
                             pos_idx, passive_bearing_gate, passive_bearing_nis_gate, ...
                             passive_bearing_weight_gain, passive_bearing_confirm_hit, ...
                             passive_bearing_fast_gate_deg, pb_track_mask);
@@ -1038,6 +1018,9 @@ for k = 1:K
                         n_passive_bearing_skipped_total = n_passive_bearing_skipped_total + ...
                             max(0, pb_stats_k.n_input - pb_stats_k.n_measurements_used);
                         passive_bearing_stats = add_passive_bearing_stats(passive_bearing_stats, pb_stats_k);
+                        if n_pb_used > 0
+                            last_passive_bearing_t = t_k;
+                        end
                         if use_imm
                             changed = any(abs(trk.m - m_before_pb) > 1e-9, 1);
                             for ti_pb = reshape(find(changed), 1, [])
@@ -1060,6 +1043,19 @@ for k = 1:K
                 end
             end
         end
+    end
+    if joint_extension_enabled && passive_bearing_enabled && trk.N > 0
+        direct_ids = passive_detail_k.updated_active_angle_track_ids;
+        grouped_ids = setdiff(passive_detail_k.updated_passive_track_ids, direct_ids);
+        [trk, passive_confirm_state, n_direct] = apply_passive_equivalent_hits( ...
+            trk, passive_confirm_state, direct_ids, ...
+            t_k, count_confirm_cycle, 1, joint_passive_confirm_max_gap_s);
+        [trk, passive_confirm_state, n_grouped] = apply_passive_equivalent_hits( ...
+            trk, passive_confirm_state, grouped_ids, ...
+            t_k, count_confirm_cycle, joint_passive_confirm_hits, ...
+            joint_passive_confirm_max_gap_s);
+        passive_equivalent_hits_total = passive_equivalent_hits_total + ...
+            n_direct + n_grouped;
     end
     est.timing.update = est.timing.update + toc(t_pb);
     t_mgmt = tic;
@@ -1153,7 +1149,7 @@ for k = 1:K
             if trk.conf(tr) == 1
                 idx_confirmed(end+1) = tr; %#ok<AGROW>
             else
-                n_hits = sum(trk.S(:, tr) == 1);   % 最近N_confirm主动周期的合规主动检测数（出生帧计1次）
+                n_hits = sum(trk.S(:, tr) == 1 | trk.S(:, tr) == 4);
                 if n_hits >= cfg.M_confirm
                     trk.conf(tr) = 1;
                     trk.w(tr) = max(trk.w(tr), w_floor_conf);
@@ -1188,24 +1184,44 @@ for k = 1:K
                            'nisbad', trk.nisbad, 'vinit', trk.vinit, ...
                            'born_t', trk.born_t, 'born_xyz', trk.born_xyz, ...
                            'last_active_hit_t', trk.last_active_hit_t, ...
+                           'last_active_nis_norm', trk.last_active_nis_norm, ...
                            'last_update_t', trk.last_update_t, ...
                            'last_passive_update_t', trk.last_passive_update_t, ...
                            'birth_kind', trk.birth_kind, 'parent_id', trk.parent_id, ...
-                           'tid', trk.tid, 'tid_conf', trk.tid_conf, ...
                            'imm_mu', imm_mu_mat);
-    est.assoc{k} = struct('id', assoc_ids, 'xyz', assoc_xyz, 'tid', assoc_tid);
+    est.assoc{k} = struct('id', assoc_ids, 'xyz', assoc_xyz, 'tid', assoc_tid, ...
+        'meas_index', assoc_meas_idx, 'type', {assoc_type}, ...
+        'innovation', assoc_innovation, 'nis', assoc_nis, ...
+        'group_size', assoc_group_size, 'innovation_kind', assoc_innovation_kind);
+    est.passive_assoc{k} = passive_detail_k;
     est.gate{k}  = struct('id', gate_ids, 'pos', gate_pos, 'S', gate_S);
 
-    if ~isempty(idx_confirmed)
-        est.X{k} = trk.m(:, idx_confirmed);
-        est.P{k} = trk.P(:, :, idx_confirmed);
-        est.N(k) = numel(idx_confirmed);
-        est.L{k} = trk.L(:, idx_confirmed)';
+    idx_output_confirmed = idx_confirmed;
+    if isfinite(confirmed_output_max_silence_s) && ~isempty(idx_output_confirmed)
+        fresh = (t_k - trk.last_update_t(idx_output_confirmed)) <= ...
+            confirmed_output_max_silence_s;
+        n_output_stale_suppressed = n_output_stale_suppressed + sum(~fresh);
+        idx_output_confirmed = idx_output_confirmed(fresh);
+    end
+    if ~isempty(idx_output_confirmed)
+        est.X{k} = trk.m(:, idx_output_confirmed);
+        est.P{k} = trk.P(:, :, idx_output_confirmed);
+        est.N(k) = numel(idx_output_confirmed);
+        est.L{k} = trk.L(:, idx_output_confirmed)';
     else
         est.X{k} = []; est.P{k} = []; est.N(k) = 0; est.L{k} = [];
     end
 
     est.timing.manage = est.timing.manage + toc(t_mgmt);
+
+    if joint_extension_enabled
+        residual_event = make_online_residual_event(k, t_k, passive_bearing, ...
+            passive_detail_k, meta_k, cfg, trk, idx_confirmed, platform);
+        [joint2d_chunk, joint2d_state] = run_filter_joint_2d3d( ...
+            residual_event, platform, joint2d_cfg, joint2d_state);
+        est.joint2d = store_online_joint2d_chunk(est.joint2d, ...
+            joint2d_chunk, joint2d_state, residual_event, k);
+    end
 
     %% ── 进度打印 ──────────────────────────────────────────────────────
     if mod(k, max(1, floor(K/10))) == 0 || k == K
@@ -1220,6 +1236,7 @@ end
 %% ── 耗时统计 ──────────────────────────────────────────────────────────
 est.timing.total = est.timing.predict + est.timing.update + est.timing.manage;
 est.passive_bearing_stats = passive_bearing_stats;
+est.passive_bearing_stats.n_equivalent_confirm_hits = passive_equivalent_hits_total;
 est.track_timeout_stats = make_track_timeout_stats(track_timeout_enabled, ...
     tentative_max_silence_s, confirmed_max_silence_s, ...
     n_timeout_tentative_total, n_timeout_confirmed_total, timeout_records);
@@ -1249,15 +1266,22 @@ est.active_assoc_stats = active_assoc_stats;
 est.track_delete_stats = delete_stats;
 est.end_of_stream = make_end_of_stream_status(trk, frame_times(end), ...
     tentative_max_silence_s, confirmed_max_silence_s);
+est.output_freshness = struct('max_silence_s', ...
+    confirmed_output_max_silence_s, ...
+    'n_suppressed', n_output_stale_suppressed);
 fprintf('\n滤波完成: 预测=%.1fs, 更新=%.1fs, 管理=%.1fs, 总计=%.1fs\n', ...
     est.timing.predict, est.timing.update, est.timing.manage, est.timing.total);
 if passive_bearing_enabled
-    fprintf('被动bearing-only更新成功: %d 次 (使用原始角度=%d, 多角度融合=%d次)\n', ...
+    fprintf('被动bearing-only更新成功: %d 次 (消耗角度量测=%d, 完成CKF更新=%d次)\n', ...
         n_passive_bearing_used_total, passive_bearing_stats.n_measurements_used, ...
-        passive_bearing_stats.n_fused_updates);
-    fprintf('被动bearing-only跳过量测: %d 个 (歧义=%d, 离散=%d, 节流=%d)\n', ...
-        n_passive_bearing_skipped_total, passive_bearing_stats.n_ambiguous_rejected, ...
-        passive_bearing_stats.n_spread_rejected, passive_bearing_stats.n_throttled);
+        passive_bearing_stats.n_single_updates);
+    fprintf('被动bearing-only跳过量测: %d 个 (门外=%d, 更新拒绝=%d, 节流=%d)\n', ...
+        n_passive_bearing_skipped_total, passive_bearing_stats.n_gate_rejected, ...
+        passive_bearing_stats.n_update_rejected, passive_bearing_stats.n_throttled);
+end
+if n_output_stale_suppressed > 0
+    fprintf('确认航迹过期输出抑制: %d 次 (输出新鲜度<=%.3f s)\n', ...
+        n_output_stale_suppressed, confirmed_output_max_silence_s);
 end
 fprintf('新生航迹: %d 条, 新生抑制(门内未分配=%d, 出生半径=%d)\n', ...
     n_birth_total, n_birth_suppressed_gated, n_birth_suppressed_guard);
@@ -1470,6 +1494,7 @@ t.conf = zeros(1, 0);
 t.miss = zeros(1, 0);
 t.age  = zeros(1, 0);
 t.nisbad = zeros(1, 0);
+t.last_active_nis_norm = zeros(1, 0);
 t.born_xyz = zeros(3, 0);
 t.born_t = zeros(1, 0);
 t.last_active_hit_t = zeros(1, 0);
@@ -1479,9 +1504,7 @@ t.birth_kind = zeros(1, 0); % 0=ordinary, 1=NIS conflict, 2=secondary conflict
 t.parent_id = zeros(1, 0);  % originating mature track when the birth was a conflict
 t.vinit = zeros(1, 0);
 t.poshist = {};          % 改进A：每条航迹的位置-时间滑窗，元素 [4×n]=[t; E; N; U]
-t.tid = zeros(1, 0);     % 改进B：航迹学到的主导目标编号(NaN=未知)
-t.tid_conf = zeros(1, 0);% 改进B：上述编号的绑定置信(投票计数)
-t.imm = {};              % 改进C：每条航迹的IMM模型bank, struct('x','P','mu')；非IMM时为[]
+t.imm = {};              % 改进B：每条航迹的IMM模型bank, struct('x','P','mu')；非IMM时为[]
 t.N = 0;
 end
 
@@ -1497,6 +1520,7 @@ t.conf = t.conf(idx);
 t.miss = t.miss(idx);
 t.age  = t.age(idx);
 t.nisbad = t.nisbad(idx);
+t.last_active_nis_norm = t.last_active_nis_norm(idx);
 t.born_xyz = t.born_xyz(:, idx);
 t.born_t = t.born_t(idx);
 t.last_active_hit_t = t.last_active_hit_t(idx);
@@ -1506,8 +1530,6 @@ t.birth_kind = t.birth_kind(idx);
 t.parent_id = t.parent_id(idx);
 t.vinit = t.vinit(idx);
 t.poshist = t.poshist(idx);
-t.tid = t.tid(idx);
-t.tid_conf = t.tid_conf(idx);
 t.imm = t.imm(idx);
 t.N = numel(t.w);
 end
@@ -1526,6 +1548,7 @@ t.conf = [a.conf, b.conf];
 t.miss = [a.miss, b.miss];
 t.age  = [a.age, b.age];
 t.nisbad = [a.nisbad, b.nisbad];
+t.last_active_nis_norm = [a.last_active_nis_norm, b.last_active_nis_norm];
 t.born_xyz = [a.born_xyz, b.born_xyz];
 t.born_t = [a.born_t, b.born_t];
 t.last_active_hit_t = [a.last_active_hit_t, b.last_active_hit_t];
@@ -1535,16 +1558,15 @@ t.birth_kind = [a.birth_kind, b.birth_kind];
 t.parent_id = [a.parent_id, b.parent_id];
 t.vinit = [a.vinit, b.vinit];
 t.poshist = [a.poshist, b.poshist];
-t.tid = [a.tid, b.tid];
-t.tid_conf = [a.tid_conf, b.tid_conf];
 t.imm = [a.imm, b.imm];
 t.N = a.N + b.N;
 end
 
 %% ═══════════════════════════════════════════════════════════════════════════
-function trk = dedup_tracks(trk, pos_idx, vel_idx, dist_thresh, vel_angle_gate, min_speed)
+function trk = dedup_tracks(trk, pos_idx, vel_idx, dist_thresh, vel_angle_gate, ...
+        min_speed)
 %DEDUP_TRACKS  按位置距离去重，确认航迹主导标签，状态取最新被喂养子航迹。
-%  自动去重只处理暂态-暂态航迹；任何已确认航迹都不凭空间邻近自动并轨。
+%  交叉保护：两条都已确认且都在运动的航迹，需速度方向一致才合并。
 N = trk.N;
 if N <= 1, return; end
 
@@ -1585,6 +1607,7 @@ out.conf = zeros(1, n_out);
 out.miss = zeros(1, n_out);
 out.age  = zeros(1, n_out);
 out.nisbad = zeros(1, n_out);
+out.last_active_nis_norm = nan(1, n_out);
 out.born_xyz = zeros(3, n_out);
 out.born_t = zeros(1, n_out);
 out.last_active_hit_t = zeros(1, n_out);
@@ -1594,8 +1617,6 @@ out.birth_kind = zeros(1, n_out);
 out.parent_id = nan(1, n_out);
 out.vinit = zeros(1, n_out);
 out.poshist = cell(1, n_out);
-out.tid = nan(1, n_out);
-out.tid_conf = zeros(1, n_out);
 out.imm = cell(1, n_out);
 
 for c = 1:n_out
@@ -1622,18 +1643,21 @@ for c = 1:n_out
         omega = omega / sum(omega);
         Pinfo = zeros(xd); xinfo = zeros(xd, 1);
         for q = 1:nm
-            Wi = omega(q) * (make_spd(trk.P(:, :, mem(q))) \ eye(xd));
+            Wi = omega(q) * inv(make_spd(trk.P(:, :, mem(q))));
             Pinfo = Pinfo + Wi;
             xinfo = xinfo + Wi * trk.m(:, mem(q));
         end
-        Pf = make_spd(Pinfo) \ eye(xd);
+        Pf = inv(make_spd(Pinfo));
         out.m(:, c)    = Pf * xinfo;
         out.P(:, :, c) = make_spd(Pf);
     end
 
-    % 命中历史：以 body 为底，任一成员的真实命中(==1)都保留下来
+    % 命中历史：主动命中优先；没有主动命中时保留被动等效逻辑命中。
     sc = trk.S(:, body);
-    sc(any(trk.S(:, mem) == 1, 2)) = 1;
+    active_rows = any(trk.S(:, mem) == 1, 2);
+    passive_rows = ~active_rows & any(trk.S(:, mem) == 4, 2);
+    sc(active_rows) = 1;
+    sc(passive_rows) = 4;
     out.S(:, c)    = sc;
 
     out.innov{c}   = trk.innov{body};
@@ -1651,11 +1675,8 @@ for c = 1:n_out
     out.parent_id(c) = trk.parent_id(lead);
     out.vinit(c)   = trk.vinit(body);
     out.nisbad(c)  = trk.nisbad(body);
+    out.last_active_nis_norm(c) = trk.last_active_nis_norm(body);
     out.poshist{c} = trk.poshist{body};       % 位置历史沿用最新被喂养的子航迹
-    % 编号绑定：取置信最高的成员(共享同号时二者一致，不冲突)
-    [~, ti_best] = max(trk.tid_conf(mem));
-    out.tid(c)     = trk.tid(mem(ti_best));
-    out.tid_conf(c) = trk.tid_conf(mem(ti_best));
     % IMM bank：把各模型重置到CI融合后的组合态，模型概率沿用 body(下一帧重新展开)
     if ~isempty(trk.imm) && numel(trk.imm) >= body && ~isempty(trk.imm{body})
         out.imm{c} = imm_reseed(trk.imm{body}, out.m(:, c), out.P(:, :, c));
@@ -1677,10 +1698,6 @@ function tf = can_merge(trk, i, j, vel_idx, vel_angle_gate, min_speed)
 % 交叉保护：两条航迹只要都在运动，就需速度方向一致才允许合并(对所有配对生效，
 % 含试探态)，避免邻近/交叉的不同目标被错误并轨。
 tf = true;
-if trk.conf(i) || trk.conf(j)
-    tf = false;
-    return;
-end
 vi = trk.m(vel_idx, i); vj = trk.m(vel_idx, j);
 si = norm(vi); sj = norm(vj);
 if si > min_speed && sj > min_speed
@@ -1693,7 +1710,7 @@ end
 end
 
 %% ═══════════════════════════════════════════════════════════════════════════
-%  改进A/B 辅助函数
+%  改进A辅助函数
 %% ═══════════════════════════════════════════════════════════════════════════
 function hist = push_poshist(hist, t_k, pos, max_n)
 % 把 (t_k, pos) 压入位置-时间滑窗，按列时间升序，仅保留最近 max_n 个样本。
@@ -1745,69 +1762,6 @@ end
 ok = true;
 end
 
-function amb = detect_ambiguous_ids(z, ids, dup_dist)
-% 重复编号歧义判别：对每个出现的有限编号，若其量测在空间上(单链)分裂为
-% ≥2 个间距 > dup_dist 的簇，则该编号覆盖了多个不同目标，相关量测标记为歧义。
-M = size(z, 2);
-amb = false(1, M);
-if M == 0 || dup_dist <= 0
-    return;
-end
-uid = unique(ids(isfinite(ids)));
-for u = 1:numel(uid)
-    idx = find(ids == uid(u));
-    if numel(idx) < 2
-        continue;
-    end
-    n_clusters = count_pos_clusters(z(:, idx), dup_dist);
-    if n_clusters >= 2
-        amb(idx) = true;
-    end
-end
-end
-
-function nc = count_pos_clusters(P, dist_thresh)
-% 单链(single-linkage)连通分量计数：点间距 < dist_thresh 视为同簇。
-n = size(P, 2);
-visited = false(1, n);
-nc = 0;
-for s = 1:n
-    if visited(s), continue; end
-    nc = nc + 1;
-    stack = s;
-    visited(s) = true;
-    while ~isempty(stack)
-        cur = stack(end);
-        stack(end) = [];
-        for j = 1:n
-            if ~visited(j) && norm(P(:, j) - P(:, cur)) < dist_thresh
-                visited(j) = true;
-                stack(end+1) = j; %#ok<AGROW>
-            end
-        end
-    end
-end
-end
-
-function [tid, conf] = vote_tid(tid, conf, assoc_id, conf_max)
-% 滞回投票：同号则置信+1；不同号则置信-1，降到0后切换为新号。
-if ~isfinite(assoc_id)
-    return;
-end
-if ~isfinite(tid)
-    tid = assoc_id;
-    conf = 1;
-elseif assoc_id == tid
-    conf = min(conf + 1, conf_max);
-else
-    conf = conf - 1;
-    if conf <= 0
-        tid = assoc_id;
-        conf = 1;
-    end
-end
-end
-
 %% ═══════════════════════════════════════════════════════════════════════════
 %  数值/模型工具函数
 %% ═══════════════════════════════════════════════════════════════════════════
@@ -1815,6 +1769,17 @@ function v = get_cfg_field(cfg, name, default_value)
 if isfield(cfg, name) && ~isempty(cfg.(name)) && ...
         (isnumeric(cfg.(name)) || islogical(cfg.(name))) && ...
         isscalar(cfg.(name)) && isfinite(double(cfg.(name)))
+    v = cfg.(name);
+else
+    v = default_value;
+end
+end
+
+function v = get_cfg_finite_or_posinf_field(cfg, name, default_value)
+if isfield(cfg, name) && ~isempty(cfg.(name)) && ...
+        (isnumeric(cfg.(name)) || islogical(cfg.(name))) && ...
+        isscalar(cfg.(name)) && ...
+        (isfinite(double(cfg.(name))) || double(cfg.(name)) == inf)
     v = cfg.(name);
 else
     v = default_value;
@@ -1838,9 +1803,7 @@ end
 function stats = empty_passive_bearing_stats()
 stats = struct('n_events_attempted', 0, 'n_input', 0, ...
     'n_updates', 0, 'n_measurements_used', 0, ...
-    'n_fused_updates', 0, 'n_single_updates', 0, ...
-    'n_ambiguous_rejected', 0, 'n_spread_rejected', 0, ...
-    'n_capacity_rejected', 0, 'n_gate_rejected', 0, ...
+    'n_single_updates', 0, 'n_gate_rejected', 0, ...
     'n_update_rejected', 0, 'n_no_track', 0, 'n_masked', 0, ...
     'n_type_disabled', 0, 'n_throttled', 0);
 end
@@ -1911,7 +1874,7 @@ end
 end
 
 %% ═══════════════════════════════════════════════════════════════════════════
-%  改进C：CA+CV 等维 IMM 多模型核心函数（模型1=CV, 模型2=CA）
+%  改进B：CA+CV 等维 IMM 多模型核心函数（模型1=CV, 模型2=CA）
 %% ═══════════════════════════════════════════════════════════════════════════
 function F = build_CV_F(dt)
 % 等维 CV：位置积分速度，速度恒定，加速度不建模(置零)
@@ -2133,8 +2096,7 @@ end
 
 function [track_meas, available, failed_mi, failed_parent, pair_nis_used, pair_dist_used] = attach_secondary_tier( ...
         track_meas, available, tier_tracks, nis_mat, z_gated, ...
-        gated_idx, R_k_meas, R_default, ids_k, amb_orig, accept_nis, pair_gate, ...
-        dist_gate, id_prior_enabled)
+        gated_idx, R_k_meas, R_default, accept_nis, pair_gate, dist_gate)
 failed_mi = zeros(1, 0);
 failed_parent = zeros(1, 0);
 pair_nis_used = zeros(1, 0);
@@ -2171,10 +2133,7 @@ for mi = secondary_idx
             nearest_pair = pair_nis;
             nearest_parent = ti;
         end
-        id_conflict = id_prior_enabled && isfinite(ids_k(orig_mi)) && ...
-            isfinite(ids_k(orig_pmi)) && ~amb_orig(orig_mi) && ~amb_orig(orig_pmi) && ...
-            ids_k(orig_mi) ~= ids_k(orig_pmi);
-        if pair_dist > dist_gate || ~isfinite(pair_nis) || pair_nis > pair_gate || id_conflict
+        if pair_dist > dist_gate || ~isfinite(pair_nis) || pair_nis > pair_gate
             continue;
         end
         if pair_nis < best_pair_nis
@@ -2257,7 +2216,18 @@ if exist('matchpairs', 'file') == 2
     end
     return;
 end
-pairs = solve_global_assignment(cost_mat, unmatched_cost);
+C = cost_mat;
+pairs = zeros(0, 2);
+while ~isempty(C) && any(isfinite(C(:)))
+    [best_val, lin_idx] = min(C(:));
+    if ~isfinite(best_val) || best_val > unmatched_cost
+        break;
+    end
+    [r, c] = ind2sub(size(C), lin_idx);
+    pairs(end+1, :) = [r, c]; %#ok<AGROW>
+    C(r, :) = inf;
+    C(:, c) = inf;
+end
 end
 
 function pb = get_passive_bearing(passive_bearing, k)
@@ -2273,12 +2243,79 @@ end
 pb.n_meas = size(pb.ang_deg, 2);
 end
 
-function [trk, n_used, stats] = update_passive_bearing(trk, pb, t_k, platform, cfg, ...
+function n = get_passive_count(passive_bearing, k)
+n = 0;
+pb = get_passive_bearing(passive_bearing, k);
+if ~isempty(pb), n = pb.n_meas; end
+end
+
+function d = empty_passive_assoc_detail(n)
+if nargin < 1, n = 0; end
+d = struct('used_mask', false(1, n), 'explained_mask', false(1, n), ...
+    'ambiguous_mask', false(1, n), 'track_id', nan(1, n), ...
+    'innovation', nan(2, n), 'nis', nan(1, n), ...
+    'group_size', zeros(1, n), 'innovation_kind', ones(1, n), ...
+    'updated_track_ids', zeros(1, 0), ...
+    'updated_passive_track_ids', zeros(1, 0), ...
+    'updated_active_angle_track_ids', zeros(1, 0));
+end
+
+function s = empty_passive_confirm_state()
+s = struct('id', zeros(1, 0), 'streak', zeros(1, 0), ...
+    'last_t', zeros(1, 0));
+end
+
+function [trk, state, n_equiv] = apply_passive_equivalent_hits( ...
+        trk, state, updated_ids, t, active_confirm_cycle, hits_per_equiv, max_gap_s)
+n_equiv = 0;
+updated_ids = unique(updated_ids(isfinite(updated_ids)));
+for id = reshape(updated_ids, 1, [])
+    si = find(state.id == id, 1);
+    if isempty(si)
+        state.id(end + 1) = id;
+        state.streak(end + 1) = 0;
+        state.last_t(end + 1) = -inf;
+        si = numel(state.id);
+    end
+    if isfinite(state.last_t(si)) && t - state.last_t(si) <= max_gap_s
+        state.streak(si) = state.streak(si) + 1;
+    else
+        state.streak(si) = 1;
+    end
+    state.last_t(si) = t;
+    if state.streak(si) < hits_per_equiv
+        continue;
+    end
+    state.streak(si) = 0;
+    ti = find(trk.L(2, :) == id, 1);
+    if isempty(ti)
+        continue;
+    end
+    active_hit = isfinite(trk.last_active_hit_t(ti)) && ...
+        abs(trk.last_active_hit_t(ti) - t) <= 1e-9;
+    if active_hit
+        continue;
+    end
+    if ~active_confirm_cycle
+        trk.S(:, ti) = [trk.S(2:end, ti); 2];
+    end
+    trk.S(end, ti) = 4; % passive-equivalent logical hit; not active range evidence
+    n_equiv = n_equiv + 1;
+end
+end
+
+function [trk, n_used, stats, detail] = update_passive_bearing(trk, pb, t_k, platform, cfg, ...
     pos_idx, gate, nis_gate, weight_gain, confirm_hit, fast_gate_deg, track_mask)
 n_used = 0;
 stats = empty_passive_bearing_stats();
 z_all = pb.ang_deg;
 M = size(z_all, 2);
+kind_all = ones(1, M);
+if isfield(pb, 'kind') && ~isempty(pb.kind)
+    nk = min(M, numel(pb.kind));
+    kind_all(1:nk) = reshape(pb.kind(1:nk), 1, []);
+end
+detail = empty_passive_assoc_detail(M);
 stats.n_input = M;
 stats.n_events_attempted = double(M > 0);
 if trk.N == 0 || M == 0
@@ -2302,12 +2339,6 @@ if ~any(track_mask)
     return;
 end
 geom = bearing_geometry(t_k, platform, cfg);
-fuse_enabled = get_cfg_field(cfg, 'passive_meas_fuse_enabled', true) ~= 0;
-max_count = max(1, round(get_cfg_field(cfg, 'passive_meas_fuse_max_count', 4)));
-max_spread_deg = get_cfg_field(cfg, 'passive_meas_fuse_max_spread_deg', 0.35);
-amb_ratio = max(1, get_cfg_field(cfg, 'passive_meas_fuse_amb_ratio', 1.5));
-amb_abs = max(0, get_cfg_field(cfg, 'passive_meas_fuse_amb_abs_nis', 0.5));
-
 if isfield(pb, 'src') && numel(pb.src) == M
     src = pb.src(:).';
 else
@@ -2315,9 +2346,10 @@ else
 end
 src(~isfinite(src)) = 0;
 
-% Independent sources are processed sequentially. Within a source, each
-% measurement belongs to at most one track, while a track may accept several
-% unambiguous bearings. They are fused once on the LOS sphere before CKF update.
+% Physical sensor types are processed sequentially. File shard numbers were
+% normalized upstream and never create independent sensor identities. A
+% bounded event batch may contain several raw bearing samples; their original
+% timestamps and measurement identities remain available in pb.
 sources = unique(src);
 for si = 1:numel(sources)
     meas_idx = find(src == sources(si));
@@ -2360,66 +2392,21 @@ for si = 1:numel(sources)
     end
 
     groups = cell(1, trk.N);
-    if fuse_enabled
-        for qi = 1:numel(meas_idx)
-            finite_tracks = find(isfinite(cost_mat(:, qi)));
-            if isempty(finite_tracks)
-                stats.n_gate_rejected = stats.n_gate_rejected + 1;
-                continue;
-            end
-            [ordered_cost, order] = sort(cost_mat(finite_tracks, qi), 'ascend');
-            best_ti = finite_tracks(order(1));
-            if numel(ordered_cost) >= 2
-                ambiguity_limit = max(ordered_cost(1) * amb_ratio, ordered_cost(1) + amb_abs);
-                if ordered_cost(2) < ambiguity_limit
-                    stats.n_ambiguous_rejected = stats.n_ambiguous_rejected + 1;
-                    continue;
-                end
-            end
-            groups{best_ti}(end+1) = qi;
-        end
-    else
-        pairs = solve_assignment(cost_mat, gate);
-        for a = 1:size(pairs, 1)
-            groups{pairs(a, 1)} = pairs(a, 2);
-        end
-        stats.n_gate_rejected = stats.n_gate_rejected + numel(meas_idx) - size(pairs, 1);
+    pairs = solve_assignment(cost_mat, gate);
+    for a = 1:size(pairs, 1)
+        groups{pairs(a, 1)} = pairs(a, 2);
     end
+    stats.n_gate_rejected = stats.n_gate_rejected + ...
+        nnz(~any(isfinite(cost_mat), 1));
 
     for ti = 1:trk.N
         local_idx = groups{ti};
         if isempty(local_idx)
             continue;
         end
-        [~, ord] = sort(cost_mat(ti, local_idx), 'ascend');
-        local_idx = local_idx(ord);
-        if fuse_enabled && numel(local_idx) > 1
-            anchor_ang = z_all(:, meas_idx(local_idx(1)));
-            keep = false(size(local_idx));
-            keep(1) = true;
-            for q = 2:numel(local_idx)
-                candidate_ang = z_all(:, meas_idx(local_idx(q)));
-                keep(q) = bearing_los_separation_deg(anchor_ang, candidate_ang) <= max_spread_deg;
-            end
-            stats.n_spread_rejected = stats.n_spread_rejected + sum(~keep);
-            local_idx = local_idx(keep);
-            if numel(local_idx) > max_count
-                stats.n_capacity_rejected = stats.n_capacity_rejected + numel(local_idx) - max_count;
-                local_idx = local_idx(1:max_count);
-            end
-        end
-
         global_idx = meas_idx(local_idx);
-        R_group = zeros(2, 2, numel(global_idx));
-        for q = 1:numel(global_idx)
-            R_group(:, :, q) = get_bearing_R(pb, global_idx(q), cfg);
-        end
-        [z_group, Rb, fuse_info] = fuse_passive_bearing_group( ...
-            z_all(:, global_idx), R_group, cost_mat(ti, local_idx), cfg);
-        if isempty(z_group) || fuse_info.n_used == 0
-            stats.n_update_rejected = stats.n_update_rejected + numel(global_idx);
-            continue;
-        end
+        z_group = z_all(:, global_idx);
+        Rb = get_bearing_R(pb, global_idx, cfg);
         [~, x_upd, P_upd, S, ~, z_pred] = ckf_update_bearing( ...
             z_group, Rb, trk.m(:, ti), trk.P(:, :, ti), t_k, platform, cfg, pos_idx, geom);
         if any(~isfinite(x_upd(:))) || any(~isfinite(P_upd(:)))
@@ -2441,6 +2428,18 @@ for si = 1:numel(sources)
         % the fact that the active sensor missed this track.
         trk.last_update_t(ti) = t_k;
         trk.last_passive_update_t(ti) = t_k;
+        detail.used_mask(global_idx) = true;
+        detail.explained_mask(global_idx) = true;
+        detail.track_id(global_idx) = trk.L(2, ti);
+        detail.innovation(:, global_idx) = repmat(nu, 1, numel(global_idx));
+        detail.nis(global_idx) = nis;
+        detail.group_size(global_idx) = numel(global_idx);
+        detail.updated_track_ids(end + 1) = trk.L(2, ti); %#ok<AGROW>
+        if any(kind_all(global_idx) == 2)
+            detail.updated_active_angle_track_ids(end + 1) = trk.L(2, ti); %#ok<AGROW>
+        else
+            detail.updated_passive_track_ids(end + 1) = trk.L(2, ti); %#ok<AGROW>
+        end
         if confirm_hit
             trk.S(end, ti) = 1;
         elseif trk.S(end, ti) ~= 1
@@ -2454,20 +2453,9 @@ for si = 1:numel(sources)
         n_used = n_used + 1;
         stats.n_updates = stats.n_updates + 1;
         stats.n_measurements_used = stats.n_measurements_used + numel(global_idx);
-        if numel(global_idx) > 1
-            stats.n_fused_updates = stats.n_fused_updates + 1;
-        else
-            stats.n_single_updates = stats.n_single_updates + 1;
-        end
+        stats.n_single_updates = stats.n_single_updates + 1;
     end
 end
-end
-
-function sep_deg = bearing_los_separation_deg(z1, z2)
-v1 = [cosd(z1(2)) * sind(z1(1)); cosd(z1(2)) * cosd(z1(1)); sind(z1(2))];
-v2 = [cosd(z2(2)) * sind(z2(1)); cosd(z2(2)) * cosd(z2(1)); sind(z2(2))];
-c = min(1, max(-1, dot(v1, v2)));
-sep_deg = acosd(c);
 end
 
 function geom = bearing_geometry(t_sec, platform, cfg)
@@ -2737,4 +2725,231 @@ else
     logdetS = log(max(det(S), realmin));
 end
 llh = -0.5 * (z_dim * log(2*pi) + logdetS + maha);
+end
+
+function cfg2 = make_online_joint2d_cfg(cfg, frame_times, passive_bearing)
+equiv_hits = max(1, round(get_cfg_field(cfg, ...
+    'joint_passive_confirm_consecutive_hits', 3)));
+cfg2 = cfg;
+cfg2.joint_confirm_M = max(1, round(get_cfg_field(cfg, ...
+    'joint_confirm_M', get_cfg_field(cfg, 'M_confirm', 3))));
+base_N = max(1, round(get_cfg_field(cfg, ...
+    'joint_confirm_N', get_cfg_field(cfg, 'N_confirm', 5))));
+has_angle = false(numel(frame_times), 1);
+for k = 1:min(numel(frame_times), numel(passive_bearing))
+    has_angle(k) = get_passive_count(passive_bearing, k) > 0;
+end
+angle_times = frame_times(has_angle);
+dt = diff(angle_times(:)); dt = dt(isfinite(dt) & dt > 1e-9);
+if isempty(dt)
+    window_events = base_N * equiv_hits;
+else
+    window_s = get_cfg_field(cfg, 'joint_passive_confirm_window_s', 1.50);
+    ratio = window_s / median(dt);
+    ratio_tol = 1e-9 * max(ratio, 1);
+    window_events = ceil(ratio - ratio_tol) + 1;
+end
+cfg2.joint_confirm_N = max([cfg2.joint_confirm_M, ...
+    base_N * equiv_hits, window_events]);
+cfg2.joint_passive_confirm_group_size = equiv_hits;
+cfg2.joint_passive_confirmation_cycles_only = true;
+cfg2.joint_birth_explain_nis = get_cfg_field(cfg, ...
+    'joint_birth_explain_nis', 1.0);
+cfg2.joint_streaming_quiet = true;
+end
+
+function est = init_online_joint2d_estimate(K, times)
+est = struct();
+est.X = cell(K, 1); est.P = cell(K, 1); est.L = cell(K, 1); est.N = zeros(K, 1);
+est.X2 = cell(K, 1); est.P2 = cell(K, 1); est.L2 = cell(K, 1); est.N2 = zeros(K, 1);
+est.N_total = zeros(K, 1); est.logical_tracks = cell(K, 1); est.output = cell(K, 1);
+est.tracks = cell(K, 1); est.assoc = cell(K, 1); est.companions = cell(K, 1);
+est.measurement_disposition = cell(K, 1);
+est.filter_times = times(:); est.event_meta = repmat(online_event_template(), K, 1);
+est.mode_counts = struct('n2d', zeros(K, 1), 'n3d', zeros(K, 1), ...
+    'nhold', zeros(K, 1));
+est.timing = struct('total', 0);
+est.transition_log = struct('id', {}, 't_sec', {}, 'from', {}, 'to', {}, 'reason', {});
+est.stats = struct();
+est.confirmation = struct();
+est.framework = 'joint_2d3d';
+est.output_contract = 'logical_track_v1';
+end
+
+function event = make_online_residual_event(k, t, passive_bearing, detail, meta, cfg, ...
+        trk, idx_confirmed, platform)
+event = online_event_template();
+event.cycle_id = k; event.t_sec = t;
+event.t_start = meta.t_start; event.t_end = meta.t_end;
+event.confirm_cycle = logical(meta.has_passive);
+geom_now = bearing_geometry(t, platform, cfg);
+if trk.N > 0
+    idx_external = 1:trk.N;
+    event.external_3d.id = trk.L(2, idx_external);
+    event.external_3d.confirmed = ismember(idx_external, idx_confirmed);
+    event.external_3d.state = trk.m(:, idx_external);
+    event.external_3d.cov = trk.P(:, :, idx_external);
+    event.external_3d.last_active_t = trk.last_active_hit_t(idx_external);
+    event.external_3d.last_update_t = trk.last_update_t(idx_external);
+    event.external_3d.nis_norm = trk.last_active_nis_norm(idx_external);
+    event.external_3d.active_hit = abs(trk.last_active_hit_t(idx_external) - t) <= 1e-9;
+    event.external_3d.active_opportunity = logical(meta.has_active);
+    event.external_3d.dimension_ready = false(1, numel(idx_external));
+    event.external_3d.fresh = false(1, numel(idx_external));
+    event.external_3d.ang = zeros(2, numel(idx_external));
+    event.external_3d.rate = nan(2, numel(idx_external));
+    output_silence = get_cfg_field(cfg, 'confirmed_output_max_silence_s', 0.5);
+    upgrade_M = max(1, round(get_cfg_field(cfg, 'joint_3d_upgrade_M', 2)));
+    upgrade_N = max(upgrade_M, round(get_cfg_field(cfg, 'joint_3d_upgrade_N', 3)));
+    rate_dt = 0.05;
+    if isfield(platform, 't_sec') && ~isempty(platform.t_sec) && ...
+            t + rate_dt > max(platform.t_sec)
+        rate_dt = -rate_dt;
+    end
+    geom_rate = bearing_geometry(t + rate_dt, platform, cfg);
+    for q = 1:numel(idx_external)
+        ti = idx_external(q);
+        event.external_3d.ang(:, q) = bearing_model_geom( ...
+            trk.m([1, 4, 7], ti), geom_now);
+        event.external_3d.rate(:, q) = bearing_rate_from_geometries( ...
+            trk.m(:, ti), rate_dt, geom_now, geom_rate);
+        w = trk.S(max(1, end - upgrade_N + 1):end, ti);
+        event.external_3d.dimension_ready(q) = nnz(w == 1) >= upgrade_M;
+        event.external_3d.fresh(q) = ~isfinite(output_silence) || ...
+            t - trk.last_update_t(ti) <= output_silence;
+    end
+end
+
+pb = get_passive_bearing(passive_bearing, k);
+if isempty(pb), return; end
+
+n = pb.n_meas;
+pb_kind_all = online_sized_row(field_or_default(pb, 'kind', ones(1, n)), n, 1);
+pb_R_all = online_covariance(field_or_default(pb, 'R_deg2', []), ...
+    2, n, diag([get_cfg_field(cfg, 'sigma_passive_az_deg', 0.05)^2, ...
+    get_cfg_field(cfg, 'sigma_passive_el_deg', 0.04)^2]));
+if isstruct(detail) && isfield(detail, 'used_mask') && isfield(detail, 'track_id')
+    used = find(online_sized_logical(detail.used_mask, n, false));
+    for mi = reshape(used, 1, [])
+        if mi <= numel(detail.track_id) && isfinite(detail.track_id(mi))
+            event = append_external_angle_update(event, detail.track_id(mi), ...
+                pb.ang_deg(:, mi), pb_R_all(:, :, mi), pb_kind_all(mi));
+        end
+    end
+end
+explained = false(1, n);
+if isstruct(detail) && isfield(detail, 'explained_mask')
+    explained = online_sized_logical(detail.explained_mask, n, false);
+end
+idx = find(~explained);
+event.has_passive = ~isempty(idx);
+event.passive.n_meas = numel(idx);
+if isempty(idx), return; end
+
+event.passive.ang = pb.ang_deg(:, idx);
+event.passive.R_ae = pb_R_all(:, :, idx);
+% The mature 3-D loop processes every packet at the current event time.
+% Use the same timestamp in the embedded 2-D branch so shard jitter cannot
+% make persistent streaming state move backwards in time.
+event.passive.t_sec = repmat(t, 1, numel(idx));
+event.passive.ids = online_sized_row(field_or_default(pb, 'tracklet_id', []), n, NaN);
+event.passive.ids = event.passive.ids(idx);
+event.passive.src = online_sized_row(field_or_default(pb, 'src', ones(1, n)), n, 1);
+event.passive.src = event.passive.src(idx);
+event.passive.kind = pb_kind_all(idx);
+event.passive.original_index = idx;
+end
+
+function event = append_external_angle_update(event, track_id, ang, R, kind)
+if ~isfinite(track_id) || numel(ang) < 2 || any(~isfinite(ang(1:2)))
+    return;
+end
+q = numel(event.external_3d.update_track_id) + 1;
+event.external_3d.update_track_id(q) = track_id;
+event.external_3d.update_ang(:, q) = reshape(ang(1:2), 2, 1);
+event.external_3d.update_R(:, :, q) = R;
+event.external_3d.update_kind(q) = kind;
+end
+
+function est = store_online_joint2d_chunk(est, chunk, state, event, k)
+cell_fields = {'X', 'P', 'L', 'X2', 'P2', 'L2', 'logical_tracks', ...
+    'output', 'tracks', 'assoc', 'companions', 'measurement_disposition'};
+for i = 1:numel(cell_fields)
+    name = cell_fields{i};
+    est.(name){k} = chunk.(name){1};
+end
+est.N(k) = chunk.N(1); est.N2(k) = chunk.N2(1);
+est.N_total(k) = chunk.N_total(1);
+est.mode_counts.n2d(k) = chunk.mode_counts.n2d(1);
+est.mode_counts.n3d(k) = chunk.mode_counts.n3d(1);
+est.mode_counts.nhold(k) = chunk.mode_counts.nhold(1);
+est.event_meta(k) = event;
+est.transition_log = [est.transition_log, chunk.transition_log];
+est.stats = state.stats;
+est.timing.total = state.timing_total;
+est.confirmation = struct('M', state.params.confirm_M, ...
+    'N_events', state.params.confirm_N, ...
+    'passive_group_size', state.params.passive_confirm_group, ...
+    'passive_max_gap_s', state.params.passive_confirm_max_gap_s);
+end
+
+function e = online_event_template()
+active = struct('t_sec', zeros(1, 0), 'xyz', zeros(3, 0), ...
+    'rae', zeros(3, 0), 'R_xyz', zeros(3, 3, 0), ...
+    'R_ae', zeros(2, 2, 0), 'has_range', false(1, 0), ...
+    'ids', zeros(1, 0), 'src', zeros(1, 0), 'n_meas', 0);
+passive = struct('t_sec', zeros(1, 0), 'ang', zeros(2, 0), ...
+    'R_ae', zeros(2, 2, 0), 'ids', zeros(1, 0), ...
+    'src', zeros(1, 0), 'kind', zeros(1, 0), ...
+    'original_index', zeros(1, 0), 'n_meas', 0);
+e = struct('cycle_id', 0, 't_sec', NaN, 't_start', NaN, 't_end', NaN, ...
+    'confirm_cycle', false, 'has_active', false, 'has_passive', false, ...
+    'active', active, 'passive', passive, ...
+    'external_3d', struct('id', zeros(1, 0), 'confirmed', false(1, 0), ...
+    'state', zeros(9, 0), 'cov', zeros(9, 9, 0), ...
+    'last_active_t', zeros(1, 0), 'last_update_t', zeros(1, 0), ...
+    'nis_norm', zeros(1, 0), ...
+    'active_hit', false(1, 0), 'active_opportunity', false, ...
+    'dimension_ready', false(1, 0), 'fresh', false(1, 0), ...
+    'ang', zeros(2, 0), 'rate', zeros(2, 0), ...
+    'update_track_id', zeros(1, 0), 'update_ang', zeros(2, 0), ...
+    'update_R', zeros(2, 2, 0), 'update_kind', zeros(1, 0)));
+end
+
+function rate = bearing_rate_from_geometries(x, dt, geom_now, geom_next)
+xyz = x([1, 4, 7]); vel = x([2, 5, 8]);
+z0 = bearing_model_geom(xyz, geom_now);
+z1 = bearing_model_geom(xyz + dt * vel, geom_next);
+rate = [angle_signed_diff_deg(z1(1), z0(1)); z1(2) - z0(2)] / dt;
+if any(~isfinite(rate)), rate(:) = NaN; end
+end
+
+function value = field_or_default(s, name, fallback)
+if isstruct(s) && isfield(s, name) && ~isempty(s.(name))
+    value = s.(name);
+else
+    value = fallback;
+end
+end
+
+function value = online_sized_row(value, n, fallback)
+if isempty(value), value = fallback * ones(1, n); else, value = value(:).'; end
+if isscalar(value) && n > 1, value = repmat(value, 1, n); end
+if numel(value) < n
+    value = [value, fallback * ones(1, n - numel(value))];
+end
+value = value(1:n);
+end
+
+function value = online_sized_logical(value, n, fallback)
+value = logical(online_sized_row(value, n, fallback));
+end
+
+function C = online_covariance(C, dim, n, fallback)
+if isempty(C), C = repmat(fallback, 1, 1, n); return; end
+if ismatrix(C), C = repmat(C, 1, 1, n); end
+if size(C, 3) < n
+    C(:, :, end + 1:n) = repmat(fallback, 1, 1, n - size(C, 3));
+end
+C = C(1:dim, 1:dim, 1:n);
 end

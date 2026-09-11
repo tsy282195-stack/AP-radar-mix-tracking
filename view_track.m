@@ -1,11 +1,13 @@
 clear play_track_filter plot_track_filter_smooth plot_pseudo_truth smooth_filter_tracks get_smoothed_track
 rehash
 
-TRACK_IDS    = [12 13 169 198];          % 要看的航迹ID：单条填 142；多条填 [3 7 142]；填 [] = 全部确认航迹
+TRACK_IDS    = [2];          % 要看的航迹ID：单条填 142；多条填 [3 7 142]；填 [] = 全部确认航迹
 DO_PLAYBACK  = false;         % 打开 play_track_filter 回放窗口
-DO_COMPARE   = false;         % 出“一次滤波 vs 二次平滑 + 量测”对比图
+DO_COMPARE   = true;         % 出“一次滤波 vs 二次平滑 + 量测”对比图
 DO_TRUTH     = true;         % 出“按目标编号连接的伪真值轨迹”单独图(最可靠)
 DO_ENU_TIME  = true;         % 出“滤波估值 vs 伪真值”东北天三轴时间序列图
+DO_TRACK_REPORT = true;      % 控制台打印单轨评价，并为每个TRACK_IDS输出TXT明细
+TRACK_REPORT_DIR = fullfile(fileparts(mfilename('fullpath')), 'track_reports');
 
 % —— 回放窗口参数 ——
 SHOW_TRUTH   = true;         % 回放里叠加伪真值线（新版 play_track_filter 已修好，可放心开）
@@ -20,8 +22,9 @@ TRAIL_WIN_S  = 10;
 TRUTH_FULL   = true;         % true=整条静态显示(推荐,随时可见) / false=随时间揭示
 TRUTH_TINT   = 0.65;         % 颜色深浅(0~1,越大越深越显眼)，原来0.3太浅
 TRUTH_WIDTH  = 2.0;          % 伪真值线宽
-TRUTH_ALL    = false;        % true=画全部目标编号的伪真值 / false=只画选中航迹相关的
-TRUTH_USE_SPLIT = [];        % []=跟随cfg.truth_id_split_enabled；true=画拆分实例；false=画原始tid
+TRUTH_SELECT_MODE = 'all_touched'; % 'dominant'=主导真值；'all_touched'=所有关联过的真值
+TRUTH_ALL    = false;     % true=忽略上一项并画数据中的全部真值目标
+TRUTH_USE_SPLIT = false;        % []=跟随cfg.truth_id_split_enabled；true=画拆分实例；false=画原始tid
 
 % —— 二次平滑参数(对比图用)——
 SMOOTH_METHOD = 'fixedlag';
@@ -52,17 +55,34 @@ if ~have
     error(['工作区没有 est / frame_times。请先运行 run_fusion_main，' ...
            '或把 RESULT_MAT 填成保存结果的 .mat 路径后再运行本脚本。']);
 end
-if isfield(est, 'framework') && strcmp(est.framework, 'joint_2d3d')
+if isfield(est, 'framework') && strncmp(est.framework, 'joint_2d3d', 10)
     if ~exist('joint_events', 'var') || isempty(joint_events)
         joint_events = est.event_meta;
     end
     jo = struct('track_ids', TRACK_IDS, 'show_reference', DO_TRUTH, ...
-        'show_angle', true, 'show_enu', DO_ENU_TIME);
+        'show_angle', true, 'show_enu', DO_ENU_TIME, ...
+        'truth_select_mode', TRUTH_SELECT_MODE, 'truth_all', TRUTH_ALL);
     if exist('cfg', 'var') && isstruct(cfg)
         jo.cfg = cfg;
-        if ~isempty(TRUTH_USE_SPLIT)
-            jo.cfg.truth_id_split_enabled = logical(TRUTH_USE_SPLIT);
+    end
+    if ~isempty(TRUTH_USE_SPLIT)
+        jo.truth_use_split = logical(TRUTH_USE_SPLIT);
+    end
+    if DO_TRACK_REPORT && ~isempty(TRACK_IDS)
+        report_opts = struct('output_dir', TRACK_REPORT_DIR, 'print_console', true);
+        report_cfg = struct();
+        if exist('cfg', 'var') && isstruct(cfg), report_cfg = cfg; end
+        if exist('metrics_info', 'var') && isstruct(metrics_info)
+            report_opts.metrics = metrics_info;
         end
+        try
+            export_track_diagnostics(est, joint_events, ...
+                report_cfg, TRACK_IDS, report_opts);
+        catch ME
+            fprintf(2, '[单轨报告失败] %s\n', ME.message);
+        end
+    elseif DO_TRACK_REPORT
+        fprintf('[单轨报告] TRACK_IDS=[] 表示总览，本次不批量导出全部航迹。\n');
     end
     view_joint_tracks(est, joint_events, jo);
     return;
@@ -161,6 +181,8 @@ fprintf('本次显示航迹ID：%s\n', mat2str(sel_ids));
 if DO_TRUTH
     to = struct();
     to.show_meas = SHOW_MEAS;
+    to.tid_select_mode = TRUTH_SELECT_MODE;
+    to.truth_all = TRUTH_ALL;
     if have_cfg
         to.cfg = cfg;
     end
@@ -169,7 +191,7 @@ if DO_TRUTH
         to.fused_xyz = fused_xyz;
         to.fused_ids = fused_ids;
     end
-    if ~TRUTH_ALL, to.track_ids = sel_ids; end   % 选中航迹决定tid；画这些tid的完整伪真值轨迹
+    to.track_ids = sel_ids;
     info = plot_pseudo_truth(est, frame_times, to); %#ok<NASGU>
 end
 
@@ -274,6 +296,8 @@ if DO_ENU_TIME
         to = struct();
         to.track_ids = sel_ids;
         to.no_figure = true;
+        to.tid_select_mode = TRUTH_SELECT_MODE;
+        to.truth_all = TRUTH_ALL;
         if have_cfg
             to.cfg = cfg;
         end
@@ -375,7 +399,7 @@ if DO_ENU_TIME
             end
         end
 
-        % -- 画三轴时间序列：滤波=粗实线，伪真值=细虚线+小圆点 --
+        % -- 画三轴时间序列：滤波=粗实线，伪真值=细实线+小圆点 --
         figure('Name', '滤波估值 vs 伪真值（ENU 时间序列）', ...
                'Color', 'w', 'Position', [80, 80, 1100, 900]);
         for ax_i = 1:3
@@ -394,7 +418,7 @@ if DO_ENU_TIME
                 if isempty(tk.t) || isempty(tk.p) || size(tk.p, 1) < 3
                     continue;
                 end
-                plot(tk.t, tk.p(ax_i, :), '--o', ...
+                plot(tk.t, tk.p(ax_i, :), 'o-', ...
                      'Color', truth_cols(q, :), 'LineWidth', 1.0, ...
                      'MarkerSize', 3, 'MarkerFaceColor', 'w', ...
                      'DisplayName', local_truth_display_name(tk.tid, truth_split_info, truth_use_split));

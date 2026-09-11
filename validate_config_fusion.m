@@ -1,4 +1,8 @@
 function cfg = validate_config_fusion(cfg)
+cfg = set_default(cfg, 'joint_2d_id_offset', 1000000);
+cfg = set_default(cfg, 'result_save_mode', 'summary');
+cfg.result_save_mode = validate_choice(cfg.result_save_mode, ...
+    {'summary', 'full'}, 'cfg.result_save_mode');
 %VALIDATE_CONFIG_FUSION  主被动融合配置一致性检查
 
 if ~isfield(cfg, 'active_files') || isempty(cfg.active_files)
@@ -22,7 +26,7 @@ end
 if ~isfield(cfg, 'read_percent') || isempty(cfg.read_percent)
     cfg.read_percent = 100;
 end
-if ~isscalar(cfg.read_percent) || ~isfinite(cfg.read_percent)
+if ~isfinite(cfg.read_percent)
     error('cfg.read_percent 必须是0到100之间的有限数值');
 end
 cfg.read_percent = min(max(cfg.read_percent, 0), 100);
@@ -32,8 +36,7 @@ end
 if ~isfield(cfg, 'read_end_percent') || isempty(cfg.read_end_percent)
     cfg.read_end_percent = cfg.read_percent;
 end
-if ~isscalar(cfg.read_start_percent) || ~isscalar(cfg.read_end_percent) || ...
-        ~isfinite(cfg.read_start_percent) || ~isfinite(cfg.read_end_percent)
+if ~isfinite(cfg.read_start_percent) || ~isfinite(cfg.read_end_percent)
     error('cfg.read_start_percent 和 cfg.read_end_percent 必须是0到100之间的有限数值');
 end
 cfg.read_start_percent = min(max(cfg.read_start_percent, 0), 100);
@@ -44,19 +47,16 @@ end
 if ~isfield(cfg, 'max_targets_per_row') || isempty(cfg.max_targets_per_row)
     cfg.max_targets_per_row = 64;
 end
-if ~isfield(cfg, 'max_rows') || isempty(cfg.max_rows) || ~isscalar(cfg.max_rows) || ...
-        isnan(cfg.max_rows) || cfg.max_rows < 1 || ...
-        (isfinite(cfg.max_rows) && floor(cfg.max_rows) ~= cfg.max_rows)
-    error('cfg.max_rows 必须为正整数或inf');
+if ~isfield(cfg, 'max_rows') || isempty(cfg.max_rows) || isnan(cfg.max_rows) || cfg.max_rows < 1
+    error('cfg.max_rows 必须为正数或inf');
 end
 if isfield(cfg, 'time_range_s') && ~isempty(cfg.time_range_s)
     if numel(cfg.time_range_s) ~= 2 || any(~isfinite(cfg.time_range_s)) || cfg.time_range_s(2) < cfg.time_range_s(1)
         error('cfg.time_range_s 必须为空或 [t_start, t_end]，且 t_end >= t_start');
     end
 end
-if ~isscalar(cfg.max_targets_per_row) || ~isfinite(cfg.max_targets_per_row) || ...
-        cfg.max_targets_per_row < 1 || floor(cfg.max_targets_per_row) ~= cfg.max_targets_per_row
-    error('cfg.max_targets_per_row 必须是正整数');
+if cfg.max_targets_per_row < 1
+    error('cfg.max_targets_per_row 必须大于等于1');
 end
 
 validate_layout(cfg.active, {'time_col','count_col','target_id_col','az_col','el_col','range_col','stride'}, 'cfg.active');
@@ -64,62 +64,22 @@ validate_vector_cols(cfg.active.valid_cols, 3, 'cfg.active.valid_cols');
 validate_layout(cfg.passive, {'time_col','count_col','target_id_col','az_col','el_col','stride'}, 'cfg.passive');
 validate_vector_cols(cfg.passive.valid_cols, 2, 'cfg.passive.valid_cols');
 validate_layout(cfg.platform, {'time_col','lat_col','lon_col','alt_col'}, 'cfg.platform');
-cfg.active.angle_unit = validate_choice(cfg.active.angle_unit, ...
-    {'deg','rad','mrad'}, 'cfg.active.angle_unit');
-cfg.passive.angle_unit = validate_choice(cfg.passive.angle_unit, ...
-    {'deg','rad','mrad'}, 'cfg.passive.angle_unit');
-cfg.platform.angle_unit = validate_choice(cfg.platform.angle_unit, ...
-    {'deg','rad','mrad'}, 'cfg.platform.angle_unit');
-cfg.active.time_format = validate_choice(cfg.active.time_format, ...
-    {'hms','seconds','second','sec','s','numeric'}, 'cfg.active.time_format');
-cfg.passive.time_format = validate_choice(cfg.passive.time_format, ...
-    {'hms','seconds','second','sec','s','numeric'}, 'cfg.passive.time_format');
-cfg.platform.time_format = validate_choice(cfg.platform.time_format, ...
-    {'hms','seconds','second','sec','s','numeric'}, 'cfg.platform.time_format');
-cfg = set_default(cfg, 'platform_max_extrapolation_s', 0.1);
-if ~isnumeric(cfg.platform_max_extrapolation_s) || ~isreal(cfg.platform_max_extrapolation_s)
-    error('cfg.platform_max_extrapolation_s 必须为有限非负实数');
-end
-must_be_nonnegative(cfg.platform_max_extrapolation_s, 'cfg.platform_max_extrapolation_s');
 
-must_be_positive(cfg.frame_time_window_s, 'cfg.frame_time_window_s');
+cfg = set_default(cfg, 'platform_max_extrapolation_s', 0.1);
+must_be_nonnegative(cfg.platform_max_extrapolation_s, ...
+    'cfg.platform_max_extrapolation_s');
+
+if cfg.frame_time_window_s <= 0
+    error('cfg.frame_time_window_s 必须为正数');
+end
 must_be_positive(cfg.sigma_range_m, 'cfg.sigma_range_m');
 must_be_positive(cfg.sigma_az_deg, 'cfg.sigma_az_deg');
 must_be_positive(cfg.sigma_el_deg, 'cfg.sigma_el_deg');
 must_be_positive(cfg.sigma_passive_az_deg, 'cfg.sigma_passive_az_deg');
 must_be_positive(cfg.sigma_passive_el_deg, 'cfg.sigma_passive_el_deg');
 
-cfg = set_default(cfg, 'condense_enable', false);
-cfg = set_default(cfg, 'condense_method', 'spatiotemporal');
-cfg = set_default(cfg, 'condense_radius_m', 100);
-cfg = set_default(cfg, 'condense_res_range_m', 100);
-cfg = set_default(cfg, 'condense_res_az_deg', 0.2);
-cfg = set_default(cfg, 'condense_res_el_deg', 0.2);
-cfg = set_default(cfg, 'condense_gate_gamma', 9);
-cfg = set_default(cfg, 'condense_birth_gamma', 6);
-cfg = set_default(cfg, 'condense_birth_merge_enabled', false);
-cfg = set_default(cfg, 'condense_amax', 10);
-cfg = set_default(cfg, 'condense_vel_beta', 0.15);
-cfg = set_default(cfg, 'condense_coast', 3);
-cfg.condense_enable = validate_flag(cfg.condense_enable, 'cfg.condense_enable');
-cfg.condense_birth_merge_enabled = validate_flag( ...
-    cfg.condense_birth_merge_enabled, 'cfg.condense_birth_merge_enabled');
-cfg.condense_method = validate_choice(cfg.condense_method, ...
-    {'spatiotemporal','resolution','radius'}, 'cfg.condense_method');
-must_be_positive(cfg.condense_radius_m, 'cfg.condense_radius_m');
-must_be_positive(cfg.condense_res_range_m, 'cfg.condense_res_range_m');
-must_be_positive(cfg.condense_res_az_deg, 'cfg.condense_res_az_deg');
-must_be_positive(cfg.condense_res_el_deg, 'cfg.condense_res_el_deg');
-must_be_positive(cfg.condense_gate_gamma, 'cfg.condense_gate_gamma');
-must_be_positive(cfg.condense_birth_gamma, 'cfg.condense_birth_gamma');
-must_be_nonnegative(cfg.condense_amax, 'cfg.condense_amax');
-must_be_probability(cfg.condense_vel_beta, 'cfg.condense_vel_beta');
-if ~isscalar(cfg.condense_coast) || ~isfinite(cfg.condense_coast) || ...
-        cfg.condense_coast < 0 || floor(cfg.condense_coast) ~= cfg.condense_coast
-    error('cfg.condense_coast 必须是非负整数帧数');
-end
-
-cfg = set_default(cfg, 'async_microbatch_dt_s', 0.005);
+    cfg = set_default(cfg, 'async_microbatch_dt_s', 0.005);
+    cfg = set_default(cfg, 'async_same_time_tolerance_s', 1e-9);
 cfg = set_default(cfg, 'async_active_time_mode', 'frame');
 cfg = set_default(cfg, 'async_passive_count_miss', false);
 cfg = set_default(cfg, 'passive_bearing_enabled', true);
@@ -132,13 +92,6 @@ cfg = set_default(cfg, 'passive_bearing_update_on_pure', true);
 cfg = set_default(cfg, 'passive_bearing_update_active_hit_tracks', false);
 cfg = set_default(cfg, 'passive_bearing_min_dt_s', 0.10);
 cfg = set_default(cfg, 'passive_bearing_fast_gate_deg', 2.0);
-cfg = set_default(cfg, 'passive_meas_fuse_enabled', true);
-cfg = set_default(cfg, 'passive_meas_fuse_weight', 'likelihood');
-cfg = set_default(cfg, 'passive_meas_fuse_R_scale', 1.5);
-cfg = set_default(cfg, 'passive_meas_fuse_max_count', 4);
-cfg = set_default(cfg, 'passive_meas_fuse_max_spread_deg', 0.35);
-cfg = set_default(cfg, 'passive_meas_fuse_amb_ratio', 1.5);
-cfg = set_default(cfg, 'passive_meas_fuse_amb_abs_nis', 0.5);
 cfg = set_default(cfg, 'active_pre_gate_enabled', false);
 cfg = set_default(cfg, 'nis_gate', 16);
 cfg = set_default(cfg, 'nis_max_bad', 5);
@@ -146,36 +99,50 @@ cfg = set_default(cfg, 'assoc_accept_nis', cfg.nis_gate);
 cfg = set_default(cfg, 'track_timeout_enabled', true);
 cfg = set_default(cfg, 'tentative_max_silence_s', 2);
 cfg = set_default(cfg, 'confirmed_max_silence_s', 6);
+cfg = set_default(cfg, 'confirmed_output_max_silence_s', 0.5);
 cfg = set_default(cfg, 'meas_fuse_enabled', true);
 cfg = set_default(cfg, 'meas_fuse_weight', 'likelihood');
 cfg = set_default(cfg, 'meas_fuse_R_scale', 1.5);
 cfg = set_default(cfg, 'meas_fuse_cluster_gamma', 16);
 cfg = set_default(cfg, 'meas_fuse_cluster_dist_m', 200);
-cfg = set_default(cfg, 'birth_guard_m', 1000);
-cfg = set_default(cfg, 'birth_suppress_gated', true);
-cfg = set_default(cfg, 'merge_pos_dist_m', 400);
-cfg = set_default(cfg, 'dedup_vel_angle_deg', 35);
-cfg = set_default(cfg, 'dedup_min_speed', 30);
 cfg = set_default(cfg, 'processing_framework', 'joint_2d3d');
 cfg = set_default(cfg, 'parallel_file_loading', false);
 cfg = set_default(cfg, 'parallel_file_workers', 0);
-cfg = set_default(cfg, 'joint_scan_tolerance_s', cfg.frame_time_window_s);
-cfg = set_default(cfg, 'joint_sync_tolerance_s', min(cfg.frame_time_window_s, 0.010));
-cfg = set_default(cfg, 'joint_shard_dedup_enabled', true);
-cfg = set_default(cfg, 'joint_shard_duplicate_angle_deg', 0.02);
-cfg = set_default(cfg, 'joint_shard_duplicate_range_m', 30);
+cfg = set_default(cfg, 'parse_cache_enabled', true);
+cfg = set_default(cfg, 'parse_cache_dir', fullfile(tempdir, 'fusion_radar_parse_cache'));
+cfg = set_default(cfg, 'active_files_share_sensor', true);
+cfg = set_default(cfg, 'joint_shard_dedup_enabled', false);
+cfg = set_default(cfg, 'joint_shard_dedup_use_truth_id', false);
+cfg = set_default(cfg, 'condense_protect_diff_id', false);
+cfg = set_default(cfg, 'use_target_id_prior', false);
+cfg = set_default(cfg, 'joint_shard_duplicate_time_s', 1e-9);
+cfg = set_default(cfg, 'joint_shard_duplicate_angle_deg', 1e-9);
 cfg = set_default(cfg, 'joint_confirm_M', 3);
 cfg = set_default(cfg, 'joint_confirm_N', 5);
+cfg = set_default(cfg, 'joint_passive_confirm_consecutive_hits', 3);
+cfg = set_default(cfg, 'joint_passive_confirm_max_gap_s', 0.20);
+cfg = set_default(cfg, 'joint_passive_confirm_window_s', 1.50);
+cfg = set_default(cfg, 'joint_passive_fast_gate_deg', inf);
+cfg = set_default(cfg, 'joint_3d_companion_accept_nis', cfg.passive_bearing_gate);
+cfg = set_default(cfg, 'joint_3d_companion_fast_gate_deg', ...
+    cfg.joint_passive_fast_gate_deg);
 cfg = set_default(cfg, 'joint_gate_2d', 9.2103);
 cfg = set_default(cfg, 'joint_gate_3d', 11.3449);
+cfg = set_default(cfg, 'joint_angle_assoc_cov_penalty', 1.0);
 cfg = set_default(cfg, 'joint_unmatched_cost', 50);
 cfg = set_default(cfg, 'joint_birth_explain_nis', 1.0);
+cfg = set_default(cfg, 'joint_2d_accept_nis', 16);
+cfg = set_default(cfg, 'joint_2d_max_direct_gap_s', 2.0);
+cfg = set_default(cfg, 'joint_2d_max_az_residual_deg', 15);
+cfg = set_default(cfg, 'joint_2d_max_el_residual_deg', 5);
+cfg = set_default(cfg, 'joint_2d_max_los_residual_deg', 15);
 cfg = set_default(cfg, 'joint_tentative_timeout_s', 3);
 cfg = set_default(cfg, 'joint_confirmed_timeout_s', 12);
-cfg = set_default(cfg, 'joint_angle_q_cv', 0.08);
-cfg = set_default(cfg, 'joint_angle_q_ca', 0.50);
-cfg = set_default(cfg, 'joint_angle_rate_birth_std_dps', 2.0);
-cfg = set_default(cfg, 'joint_angle_acc_birth_std_dps2', 3.0);
+cfg = set_default(cfg, 'joint_2d_output_max_silence_s', 0.5);
+cfg = set_default(cfg, 'joint_angle_q_cv', 0.02);
+cfg = set_default(cfg, 'joint_angle_q_ca', 0.12);
+cfg = set_default(cfg, 'joint_angle_rate_birth_std_dps', 0.75);
+cfg = set_default(cfg, 'joint_angle_acc_birth_std_dps2', 1.0);
 cfg = set_default(cfg, 'joint_space_sigma_a_cv', 12);
 cfg = set_default(cfg, 'joint_space_sigma_j_ca', 15);
 cfg = set_default(cfg, 'joint_space_vel_birth_std_mps', 500);
@@ -190,10 +157,7 @@ cfg = set_default(cfg, 'joint_3d_upgrade_M', 2);
 cfg = set_default(cfg, 'joint_3d_upgrade_N', 3);
 cfg = set_default(cfg, 'joint_up_consecutive', 1);
 cfg = set_default(cfg, 'joint_down_consecutive', 3);
-cfg = set_default(cfg, 'joint_radial_sigma_warn_m', 5000);
-cfg = set_default(cfg, 'joint_radial_sigma_drop_m', 10000);
-cfg = set_default(cfg, 'joint_range_age_warn_s', 3);
-cfg = set_default(cfg, 'joint_range_age_drop_s', 10);
+cfg = set_default(cfg, 'joint_quality_eval_interval_s', 0.10);
 cfg = set_default(cfg, 'joint_pos95_warn_m', 15000);
 cfg = set_default(cfg, 'joint_pos95_down_m', 30000);
 cfg = set_default(cfg, 'joint_pos95_recover_m', 10000);
@@ -213,76 +177,135 @@ cfg = set_default(cfg, 'joint_mode_3d_prior_cost', 0.5);
 cfg = set_default(cfg, 'joint_merge_angle_deg', 0.08);
 cfg = set_default(cfg, 'joint_merge_rate_dps', 1.0);
 cfg = set_default(cfg, 'joint_merge_nis', 13.2767);
-cfg = set_default(cfg, 'joint_history_level', 'output');
+cfg = set_default(cfg, 'joint_2d3d_fusion_angle_deg', 0.30);
+cfg = set_default(cfg, 'joint_2d3d_fusion_rate_dps', 1.5);
+cfg = set_default(cfg, 'joint_2d3d_fusion_min_cycles', 3);
+cfg = set_default(cfg, 'joint_dimension_switch_enabled', true);
+cfg = set_default(cfg, 'joint_2d3d_upgrade_match_cycles', 2);
+cfg = set_default(cfg, 'joint_external_rebind_enabled', true);
+cfg = set_default(cfg, 'joint_external_rebind_ambiguity_nis', 1.0);
+cfg = set_default(cfg, 'joint_external_rebind_max_gap_s', 2.0);
+cfg = set_default(cfg, 'joint_projection_cache_enabled', true);
+cfg = set_default(cfg, 'joint_progress_interval_events', 50);
 
 cfg.async_active_time_mode = validate_choice(cfg.async_active_time_mode, ...
     {'frame','plot'}, 'cfg.async_active_time_mode');
-cfg.passive_meas_fuse_weight = validate_choice(cfg.passive_meas_fuse_weight, ...
-    {'likelihood','equal'}, 'cfg.passive_meas_fuse_weight');
 cfg.meas_fuse_weight = validate_choice(cfg.meas_fuse_weight, ...
     {'likelihood','equal'}, 'cfg.meas_fuse_weight');
 cfg.processing_framework = validate_choice(cfg.processing_framework, ...
     {'joint_2d3d','legacy_active3d'}, 'cfg.processing_framework');
-cfg.joint_history_level = validate_choice(cfg.joint_history_level, ...
-    {'output','diagnostic','full'}, 'cfg.joint_history_level');
 cfg.async_passive_count_miss = validate_flag(cfg.async_passive_count_miss, 'cfg.async_passive_count_miss');
 cfg.passive_bearing_enabled = validate_flag(cfg.passive_bearing_enabled, 'cfg.passive_bearing_enabled');
+cfg.joint_dimension_switch_enabled = validate_flag(cfg.joint_dimension_switch_enabled, ...
+    'cfg.joint_dimension_switch_enabled');
 cfg.passive_bearing_confirm_hit = validate_flag(cfg.passive_bearing_confirm_hit, 'cfg.passive_bearing_confirm_hit');
 cfg.passive_bearing_update_on_active = validate_flag(cfg.passive_bearing_update_on_active, 'cfg.passive_bearing_update_on_active');
 cfg.passive_bearing_update_on_pure = validate_flag(cfg.passive_bearing_update_on_pure, 'cfg.passive_bearing_update_on_pure');
 cfg.passive_bearing_update_active_hit_tracks = validate_flag(cfg.passive_bearing_update_active_hit_tracks, 'cfg.passive_bearing_update_active_hit_tracks');
-cfg.passive_meas_fuse_enabled = validate_flag(cfg.passive_meas_fuse_enabled, 'cfg.passive_meas_fuse_enabled');
 cfg.active_pre_gate_enabled = validate_flag(cfg.active_pre_gate_enabled, 'cfg.active_pre_gate_enabled');
 cfg.track_timeout_enabled = validate_flag(cfg.track_timeout_enabled, 'cfg.track_timeout_enabled');
 cfg.meas_fuse_enabled = validate_flag(cfg.meas_fuse_enabled, 'cfg.meas_fuse_enabled');
-cfg.birth_suppress_gated = validate_flag(cfg.birth_suppress_gated, ...
-    'cfg.birth_suppress_gated');
+cfg.active_files_share_sensor = validate_flag(cfg.active_files_share_sensor, ...
+    'cfg.active_files_share_sensor');
 cfg.joint_shard_dedup_enabled = validate_flag(cfg.joint_shard_dedup_enabled, ...
     'cfg.joint_shard_dedup_enabled');
+cfg.joint_shard_dedup_use_truth_id = validate_flag( ...
+    cfg.joint_shard_dedup_use_truth_id, 'cfg.joint_shard_dedup_use_truth_id');
+cfg.condense_protect_diff_id = validate_flag(cfg.condense_protect_diff_id, ...
+    'cfg.condense_protect_diff_id');
+cfg.use_target_id_prior = validate_flag(cfg.use_target_id_prior, ...
+    'cfg.use_target_id_prior');
+if cfg.joint_shard_dedup_use_truth_id || cfg.condense_protect_diff_id || ...
+        cfg.use_target_id_prior
+    error(['target_id仅限评价/绘图使用；joint_shard_dedup_use_truth_id、' ...
+        'condense_protect_diff_id和use_target_id_prior必须保持false。']);
+end
+cfg.joint_projection_cache_enabled = validate_flag( ...
+    cfg.joint_projection_cache_enabled, 'cfg.joint_projection_cache_enabled');
 cfg.parallel_file_loading = validate_flag(cfg.parallel_file_loading, ...
     'cfg.parallel_file_loading');
+cfg.parse_cache_enabled = validate_flag(cfg.parse_cache_enabled, ...
+    'cfg.parse_cache_enabled');
+if strcmp(cfg.processing_framework, 'legacy_active3d') && isempty(cfg.active_files)
+    error('legacy_active3d框架要求至少一个主动雷达文件。');
+end
+if isempty(cfg.active_files) && ~cfg.passive_bearing_enabled
+    error('仅配置被动文件时，cfg.passive_bearing_enabled必须为true。');
+end
 
-must_be_nonnegative(cfg.async_microbatch_dt_s, 'cfg.async_microbatch_dt_s');
+    must_be_nonnegative(cfg.async_microbatch_dt_s, ...
+        'cfg.async_microbatch_dt_s');
+    must_be_nonnegative(cfg.async_same_time_tolerance_s, ...
+    'cfg.async_same_time_tolerance_s');
+if cfg.async_same_time_tolerance_s > 1e-6
+    error(['cfg.async_same_time_tolerance_s只能处理同一时刻的浮点误差，' ...
+        '不得大于1e-6 s。']);
+end
 must_be_positive(cfg.passive_bearing_gate, 'cfg.passive_bearing_gate');
 must_be_positive(cfg.passive_bearing_nis_gate, 'cfg.passive_bearing_nis_gate');
 must_be_nonnegative(cfg.passive_bearing_weight_gain, 'cfg.passive_bearing_weight_gain');
 must_be_nonnegative(cfg.passive_bearing_min_dt_s, 'cfg.passive_bearing_min_dt_s');
 must_be_nonnegative(cfg.passive_bearing_fast_gate_deg, 'cfg.passive_bearing_fast_gate_deg');
-must_be_positive(cfg.passive_meas_fuse_R_scale, 'cfg.passive_meas_fuse_R_scale');
-must_be_nonnegative(cfg.passive_meas_fuse_max_spread_deg, 'cfg.passive_meas_fuse_max_spread_deg');
-must_be_nonnegative(cfg.passive_meas_fuse_amb_abs_nis, 'cfg.passive_meas_fuse_amb_abs_nis');
 must_be_positive(cfg.assoc_accept_nis, 'cfg.assoc_accept_nis');
 must_be_positive_or_inf(cfg.tentative_max_silence_s, 'cfg.tentative_max_silence_s');
 must_be_positive_or_inf(cfg.confirmed_max_silence_s, 'cfg.confirmed_max_silence_s');
+must_be_nonnegative_or_inf(cfg.confirmed_output_max_silence_s, ...
+    'cfg.confirmed_output_max_silence_s');
 must_be_positive(cfg.meas_fuse_R_scale, 'cfg.meas_fuse_R_scale');
 must_be_positive(cfg.meas_fuse_cluster_gamma, 'cfg.meas_fuse_cluster_gamma');
 must_be_positive(cfg.meas_fuse_cluster_dist_m, 'cfg.meas_fuse_cluster_dist_m');
-must_be_nonnegative(cfg.birth_guard_m, 'cfg.birth_guard_m');
-must_be_nonnegative(cfg.merge_pos_dist_m, 'cfg.merge_pos_dist_m');
-if ~isscalar(cfg.dedup_vel_angle_deg) || ~isfinite(cfg.dedup_vel_angle_deg) || ...
-        cfg.dedup_vel_angle_deg < 0 || cfg.dedup_vel_angle_deg > 180
-    error('cfg.dedup_vel_angle_deg 必须位于 [0, 180] 度');
-end
-must_be_nonnegative(cfg.dedup_min_speed, 'cfg.dedup_min_speed');
-must_be_nonnegative(cfg.joint_scan_tolerance_s, 'cfg.joint_scan_tolerance_s');
+must_be_nonnegative(cfg.joint_quality_eval_interval_s, ...
+    'cfg.joint_quality_eval_interval_s');
 if ~isscalar(cfg.parallel_file_workers) || ~isfinite(cfg.parallel_file_workers) || ...
         cfg.parallel_file_workers < 0 || floor(cfg.parallel_file_workers) ~= cfg.parallel_file_workers
     error('cfg.parallel_file_workers 必须是非负整数，0表示自动');
 end
-must_be_nonnegative(cfg.joint_sync_tolerance_s, 'cfg.joint_sync_tolerance_s');
-if cfg.joint_sync_tolerance_s > cfg.joint_scan_tolerance_s
-    error('cfg.joint_sync_tolerance_s 不得大于 cfg.joint_scan_tolerance_s');
+if isa(cfg.parse_cache_dir, 'string')
+    if ~isscalar(cfg.parse_cache_dir), error('cfg.parse_cache_dir 必须是单一路径'); end
+    cfg.parse_cache_dir = char(cfg.parse_cache_dir);
+end
+if ~ischar(cfg.parse_cache_dir) || isempty(strtrim(cfg.parse_cache_dir))
+    error('cfg.parse_cache_dir 必须是非空路径');
 end
 must_be_nonnegative(cfg.joint_shard_duplicate_angle_deg, ...
     'cfg.joint_shard_duplicate_angle_deg');
-must_be_nonnegative(cfg.joint_shard_duplicate_range_m, ...
-    'cfg.joint_shard_duplicate_range_m');
+must_be_nonnegative(cfg.joint_shard_duplicate_time_s, ...
+    'cfg.joint_shard_duplicate_time_s');
+if cfg.joint_shard_duplicate_time_s > 1e-6 || ...
+        cfg.joint_shard_duplicate_angle_deg > 1e-6
+    error('重叠文件去重只允许精确重复行；时间和角度容差均不得大于1e-6。');
+end
 must_be_positive(cfg.joint_gate_2d, 'cfg.joint_gate_2d');
 must_be_positive(cfg.joint_gate_3d, 'cfg.joint_gate_3d');
+must_be_nonnegative(cfg.joint_angle_assoc_cov_penalty, ...
+    'cfg.joint_angle_assoc_cov_penalty');
 must_be_positive(cfg.joint_unmatched_cost, 'cfg.joint_unmatched_cost');
 must_be_nonnegative(cfg.joint_birth_explain_nis, 'cfg.joint_birth_explain_nis');
+must_be_positive_or_inf(cfg.joint_2d_accept_nis, 'cfg.joint_2d_accept_nis');
+must_be_positive_or_inf(cfg.joint_2d_max_direct_gap_s, ...
+    'cfg.joint_2d_max_direct_gap_s');
+must_be_positive_or_inf(cfg.joint_2d_max_az_residual_deg, ...
+    'cfg.joint_2d_max_az_residual_deg');
+must_be_positive_or_inf(cfg.joint_2d_max_el_residual_deg, ...
+    'cfg.joint_2d_max_el_residual_deg');
+must_be_positive_or_inf(cfg.joint_2d_max_los_residual_deg, ...
+    'cfg.joint_2d_max_los_residual_deg');
+must_be_positive_integer(cfg.joint_passive_confirm_consecutive_hits, ...
+    'cfg.joint_passive_confirm_consecutive_hits');
+must_be_positive(cfg.joint_passive_confirm_max_gap_s, ...
+    'cfg.joint_passive_confirm_max_gap_s');
+must_be_positive(cfg.joint_passive_confirm_window_s, ...
+    'cfg.joint_passive_confirm_window_s');
+must_be_positive_or_inf(cfg.joint_passive_fast_gate_deg, ...
+    'cfg.joint_passive_fast_gate_deg');
+must_be_positive_or_inf(cfg.joint_3d_companion_accept_nis, ...
+    'cfg.joint_3d_companion_accept_nis');
+must_be_positive_or_inf(cfg.joint_3d_companion_fast_gate_deg, ...
+    'cfg.joint_3d_companion_fast_gate_deg');
 must_be_positive_or_inf(cfg.joint_tentative_timeout_s, 'cfg.joint_tentative_timeout_s');
 must_be_positive_or_inf(cfg.joint_confirmed_timeout_s, 'cfg.joint_confirmed_timeout_s');
+must_be_nonnegative_or_inf(cfg.joint_2d_output_max_silence_s, ...
+    'cfg.joint_2d_output_max_silence_s');
 must_be_nonnegative(cfg.joint_angle_q_cv, 'cfg.joint_angle_q_cv');
 must_be_nonnegative(cfg.joint_angle_q_ca, 'cfg.joint_angle_q_ca');
 must_be_positive(cfg.joint_angle_rate_birth_std_dps, 'cfg.joint_angle_rate_birth_std_dps');
@@ -300,10 +323,6 @@ validate_m_of_n(cfg.joint_3d_birth_M, cfg.joint_3d_birth_N, 'joint_3d_birth');
 validate_m_of_n(cfg.joint_3d_upgrade_M, cfg.joint_3d_upgrade_N, 'joint_3d_upgrade');
 must_be_positive_integer(cfg.joint_up_consecutive, 'cfg.joint_up_consecutive');
 must_be_positive_integer(cfg.joint_down_consecutive, 'cfg.joint_down_consecutive');
-must_be_positive(cfg.joint_radial_sigma_warn_m, 'cfg.joint_radial_sigma_warn_m');
-must_be_positive(cfg.joint_radial_sigma_drop_m, 'cfg.joint_radial_sigma_drop_m');
-must_be_positive(cfg.joint_range_age_warn_s, 'cfg.joint_range_age_warn_s');
-must_be_positive(cfg.joint_range_age_drop_s, 'cfg.joint_range_age_drop_s');
 must_be_positive_integer(cfg.joint_space_nis_window, 'cfg.joint_space_nis_window');
 must_be_positive(cfg.joint_max_predict_dt_s, 'cfg.joint_max_predict_dt_s');
 must_be_positive(cfg.joint_switch_gate_2d, 'cfg.joint_switch_gate_2d');
@@ -317,6 +336,24 @@ must_be_nonnegative(cfg.joint_mode_3d_prior_cost, 'cfg.joint_mode_3d_prior_cost'
 must_be_nonnegative(cfg.joint_merge_angle_deg, 'cfg.joint_merge_angle_deg');
 must_be_nonnegative(cfg.joint_merge_rate_dps, 'cfg.joint_merge_rate_dps');
 must_be_positive(cfg.joint_merge_nis, 'cfg.joint_merge_nis');
+must_be_nonnegative(cfg.joint_2d3d_fusion_angle_deg, ...
+    'cfg.joint_2d3d_fusion_angle_deg');
+must_be_nonnegative(cfg.joint_2d3d_fusion_rate_dps, ...
+    'cfg.joint_2d3d_fusion_rate_dps');
+must_be_positive_integer(cfg.joint_2d3d_fusion_min_cycles, ...
+    'cfg.joint_2d3d_fusion_min_cycles');
+must_be_positive_integer(cfg.joint_2d3d_upgrade_match_cycles, ...
+    'cfg.joint_2d3d_upgrade_match_cycles');
+must_be_nonnegative(cfg.joint_external_rebind_ambiguity_nis, ...
+    'cfg.joint_external_rebind_ambiguity_nis');
+must_be_positive(cfg.joint_external_rebind_max_gap_s, ...
+    'cfg.joint_external_rebind_max_gap_s');
+must_be_positive_integer(cfg.joint_progress_interval_events, ...
+    'cfg.joint_progress_interval_events');
+must_be_positive_integer(cfg.joint_2d_id_offset, 'cfg.joint_2d_id_offset');
+if cfg.joint_2d_id_offset <= cfg.max_tracks
+    error('cfg.joint_2d_id_offset must exceed cfg.max_tracks.');
+end
 must_be_nonnegative(cfg.joint_pos95_recover_m, 'cfg.joint_pos95_recover_m');
 must_be_positive(cfg.joint_pos95_warn_m, 'cfg.joint_pos95_warn_m');
 must_be_positive(cfg.joint_pos95_down_m, 'cfg.joint_pos95_down_m');
@@ -326,12 +363,6 @@ must_be_positive(cfg.joint_radial95_down_m, 'cfg.joint_radial95_down_m');
 must_be_nonnegative(cfg.joint_space_nis_recover, 'cfg.joint_space_nis_recover');
 must_be_positive(cfg.joint_space_nis_warn, 'cfg.joint_space_nis_warn');
 must_be_positive(cfg.joint_space_nis_down, 'cfg.joint_space_nis_down');
-if ~(cfg.joint_radial_sigma_warn_m < cfg.joint_radial_sigma_drop_m)
-    error('径向距离不确定度阈值要求 warn < drop');
-end
-if ~(cfg.joint_range_age_warn_s < cfg.joint_range_age_drop_s)
-    error('有效距离信息龄期阈值要求 warn < drop');
-end
 if ~(cfg.joint_pos95_recover_m < cfg.joint_pos95_warn_m && ...
         cfg.joint_pos95_warn_m < cfg.joint_pos95_down_m)
     error('三维位置门限要求 recover < warn < down');
@@ -352,14 +383,6 @@ if cfg.joint_birth_explain_nis > min(cfg.joint_gate_2d, cfg.joint_gate_3d)
 end
 if cfg.joint_confirmed_timeout_s < cfg.joint_tentative_timeout_s
     error('cfg.joint_confirmed_timeout_s 应不小于 cfg.joint_tentative_timeout_s');
-end
-if ~isscalar(cfg.passive_meas_fuse_max_count) || ~isfinite(cfg.passive_meas_fuse_max_count) || ...
-        cfg.passive_meas_fuse_max_count < 1 || floor(cfg.passive_meas_fuse_max_count) ~= cfg.passive_meas_fuse_max_count
-    error('cfg.passive_meas_fuse_max_count 必须是正整数');
-end
-if ~isscalar(cfg.passive_meas_fuse_amb_ratio) || ~isfinite(cfg.passive_meas_fuse_amb_ratio) || ...
-        cfg.passive_meas_fuse_amb_ratio < 1
-    error('cfg.passive_meas_fuse_amb_ratio 必须 >= 1');
 end
 if ~(ischar(cfg.local_origin) && strcmp(cfg.local_origin, 'first_platform')) && ...
         ~(isnumeric(cfg.local_origin) && numel(cfg.local_origin) == 3 && all(isfinite(cfg.local_origin)))
@@ -414,18 +437,7 @@ if isfield(cfg, 'vel_trend_span_s') && ~isempty(cfg.vel_trend_span_s) && cfg.vel
     error('cfg.vel_trend_span_s 必须 >= 0');
 end
 
-% ── 改进B：编号先验参数校验 ──
-if isfield(cfg, 'id_dup_dist_m') && ~isempty(cfg.id_dup_dist_m) && cfg.id_dup_dist_m <= 0
-    error('cfg.id_dup_dist_m 必须为正数(重复编号去重簇间距门)');
-end
-if isfield(cfg, 'id_prior_cost_bonus') && ~isempty(cfg.id_prior_cost_bonus) && cfg.id_prior_cost_bonus < 0
-    error('cfg.id_prior_cost_bonus 必须 >= 0');
-end
-if isfield(cfg, 'id_prior_min_conf') && ~isempty(cfg.id_prior_min_conf) && cfg.id_prior_min_conf < 1
-    error('cfg.id_prior_min_conf 必须 >= 1');
-end
-
-% ── 改进C：IMM 参数校验/规整 ──
+% ── 改进B：IMM 参数校验/规整 ──
 for fld = {'imm_p_cv_stay', 'imm_p_ca_stay', 'imm_mu_init_cv'}
     nm = fld{1};
     if isfield(cfg, nm) && ~isempty(cfg.(nm))
@@ -442,9 +454,18 @@ end
 cfg = set_default(cfg, 'joint_plot_min_life', 3);
 cfg = set_default(cfg, 'metrics_enabled', true);
 cfg = set_default(cfg, 'metrics_max_print', 12);
-cfg = set_default(cfg, 'track_accuracy_purity_th', 0.80);
+cfg = set_default(cfg, 'metrics_progress_enabled', true);
+cfg = set_default(cfg, 'track_accuracy_purity_th', 0.99);
 cfg = set_default(cfg, 'track_accuracy_min_assoc', 3);
+cfg = set_default(cfg, 'truth_file', '');
+cfg = set_default(cfg, 'truth_auto_discover', true);
+cfg = set_default(cfg, 'truth_altitude_is_absolute', true);
+cfg = set_default(cfg, 'truth_real_time_tolerance_s', 0.03);
+cfg = set_default(cfg, 'truth_time_origin_s', []);
 cfg = set_default(cfg, 'truth_id_split_enabled', true);
+cfg = set_default(cfg, 'truth_id_split_dist_m', 10000);
+cfg = set_default(cfg, 'truth_id_split_max_gap_s', 30);
+cfg = set_default(cfg, 'truth_assoc_map_max_dist_m', inf);
 cfg = set_default(cfg, 'truth_cross_sensor_id_consistent', false);
 cfg = set_default(cfg, 'truth_cross_sensor_match_angle_deg', 1.0);
 cfg = set_default(cfg, 'truth_cross_sensor_match_max_dt_s', 0.5);
@@ -452,28 +473,17 @@ cfg = set_default(cfg, 'truth_cross_sensor_match_min_points', 3);
 cfg = set_default(cfg, 'truth_cross_sensor_match_min_ratio', 0.20);
 cfg = set_default(cfg, 'truth_cross_sensor_match_ambiguity_deg', 0.10);
 cfg = set_default(cfg, 'truth_cross_sensor_match_max_samples', 200);
-cfg = set_default(cfg, 'truth_id_split_dist_m', 10000);
-cfg = set_default(cfg, 'truth_id_split_max_gap_s', 30);
-cfg = set_default(cfg, 'truth_assoc_map_max_dist_m', inf);
 cfg = set_default(cfg, 'truth_rts_meas_std_m', 1000);
 cfg = set_default(cfg, 'truth_rts_proc_std_mps2', 10);
 cfg = set_default(cfg, 'truth_rms_time_tolerance_s', cfg.frame_time_window_s);
-cfg = set_default(cfg, 'truth_file', '');
-cfg = set_default(cfg, 'truth_auto_discover', true);
-cfg = set_default(cfg, 'truth_altitude_is_absolute', true);
-cfg = set_default(cfg, 'truth_real_time_tolerance_s', max(cfg.frame_time_window_s, 0.03));
+cfg.metrics_progress_enabled = validate_flag(cfg.metrics_progress_enabled, ...
+    'cfg.metrics_progress_enabled');
 cfg.truth_auto_discover = validate_flag(cfg.truth_auto_discover, ...
     'cfg.truth_auto_discover');
 cfg.truth_altitude_is_absolute = validate_flag(cfg.truth_altitude_is_absolute, ...
     'cfg.truth_altitude_is_absolute');
-cfg.truth_id_split_enabled = validate_flag(cfg.truth_id_split_enabled, ...
-    'cfg.truth_id_split_enabled');
 cfg.truth_cross_sensor_id_consistent = validate_flag( ...
     cfg.truth_cross_sensor_id_consistent, 'cfg.truth_cross_sensor_id_consistent');
-if ~cfg.truth_id_split_enabled && ~cfg.truth_cross_sensor_id_consistent
-    error(['关闭 cfg.truth_id_split_enabled 时必须确认 ' ...
-        'cfg.truth_cross_sensor_id_consistent=true；否则主被动相同数字编号会被错误视为同一目标。']);
-end
 if isa(cfg.truth_file, 'string') && isscalar(cfg.truth_file)
     cfg.truth_file = char(cfg.truth_file);
 end
@@ -486,9 +496,10 @@ if ~isscalar(cfg.joint_plot_min_life) || ~isfinite(cfg.joint_plot_min_life) || .
         floor(cfg.joint_plot_min_life) ~= cfg.joint_plot_min_life
     error('cfg.joint_plot_min_life 必须是正整数');
 end
-if ~isscalar(cfg.metrics_max_print) || ~isfinite(cfg.metrics_max_print) || cfg.metrics_max_print < 0 || ...
+if ~isscalar(cfg.metrics_max_print) || ~isfinite(cfg.metrics_max_print) || ...
+        cfg.metrics_max_print < 0 || ...
         floor(cfg.metrics_max_print) ~= cfg.metrics_max_print
-    error('cfg.metrics_max_print 必须是非负整数，0表示不打印');
+    error('cfg.metrics_max_print 必须是非负整数，0表示不打印评价报告');
 end
 if ~isfinite(cfg.track_accuracy_purity_th) || cfg.track_accuracy_purity_th < 0 || ...
         cfg.track_accuracy_purity_th > 1
@@ -505,6 +516,22 @@ if isnan(cfg.truth_id_split_max_gap_s) || isnan(cfg.truth_assoc_map_max_dist_m) 
         cfg.truth_id_split_max_gap_s < 0 || cfg.truth_assoc_map_max_dist_m < 0
     error('伪真值编号分割的最大间隔和映射距离必须为非负数');
 end
+must_be_positive(cfg.truth_cross_sensor_match_angle_deg, ...
+    'cfg.truth_cross_sensor_match_angle_deg');
+must_be_nonnegative(cfg.truth_cross_sensor_match_max_dt_s, ...
+    'cfg.truth_cross_sensor_match_max_dt_s');
+must_be_positive_integer(cfg.truth_cross_sensor_match_min_points, ...
+    'cfg.truth_cross_sensor_match_min_points');
+if ~isscalar(cfg.truth_cross_sensor_match_min_ratio) || ...
+        ~isfinite(cfg.truth_cross_sensor_match_min_ratio) || ...
+        cfg.truth_cross_sensor_match_min_ratio <= 0 || ...
+        cfg.truth_cross_sensor_match_min_ratio > 1
+    error('cfg.truth_cross_sensor_match_min_ratio 必须位于 (0, 1]');
+end
+must_be_nonnegative(cfg.truth_cross_sensor_match_ambiguity_deg, ...
+    'cfg.truth_cross_sensor_match_ambiguity_deg');
+must_be_positive_integer(cfg.truth_cross_sensor_match_max_samples, ...
+    'cfg.truth_cross_sensor_match_max_samples');
 if ~isfinite(cfg.truth_rts_meas_std_m) || ~isfinite(cfg.truth_rts_proc_std_mps2) || ...
         ~isfinite(cfg.truth_rms_time_tolerance_s) || ...
         cfg.truth_rts_meas_std_m <= 0 || cfg.truth_rts_proc_std_mps2 <= 0 || ...
@@ -513,18 +540,10 @@ if ~isfinite(cfg.truth_rts_meas_std_m) || ~isfinite(cfg.truth_rts_proc_std_mps2)
 end
 must_be_nonnegative(cfg.truth_real_time_tolerance_s, ...
     'cfg.truth_real_time_tolerance_s');
-must_be_positive(cfg.truth_cross_sensor_match_angle_deg, ...
-    'cfg.truth_cross_sensor_match_angle_deg');
-must_be_nonnegative(cfg.truth_cross_sensor_match_max_dt_s, ...
-    'cfg.truth_cross_sensor_match_max_dt_s');
-must_be_positive_integer(cfg.truth_cross_sensor_match_min_points, ...
-    'cfg.truth_cross_sensor_match_min_points');
-must_be_probability(cfg.truth_cross_sensor_match_min_ratio, ...
-    'cfg.truth_cross_sensor_match_min_ratio');
-must_be_nonnegative(cfg.truth_cross_sensor_match_ambiguity_deg, ...
-    'cfg.truth_cross_sensor_match_ambiguity_deg');
-must_be_positive_integer(cfg.truth_cross_sensor_match_max_samples, ...
-    'cfg.truth_cross_sensor_match_max_samples');
+if ~isempty(cfg.truth_time_origin_s) && ...
+        (~isscalar(cfg.truth_time_origin_s) || ~isfinite(cfg.truth_time_origin_s))
+    error('cfg.truth_time_origin_s 必须为空或有限标量秒数');
+end
 
 for i = 1:numel(cfg.active_files)
     assert_file_exists(resolve_data_path(cfg.data_dir, cfg.active_files{i}), '主动雷达');
@@ -597,6 +616,12 @@ end
 function must_be_positive_or_inf(value, label)
 if ~isscalar(value) || isnan(value) || value <= 0
     error('%s 必须为正数或inf', label);
+end
+end
+
+function must_be_nonnegative_or_inf(value, label)
+if ~isscalar(value) || isnan(value) || value < 0
+    error('%s 必须为非负数或inf', label);
 end
 end
 
