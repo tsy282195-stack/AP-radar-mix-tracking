@@ -1,0 +1,238 @@
+--- config_fusion.m
++++ config_fusion.m
+@@ -337,18 +337,29 @@
+ cfg.joint_switch_gate_2d = 9.2103;       % 模式切换角度一致门
+ cfg.joint_switch_cov_inflate = 2.0;      % 模式切换协方差膨胀
+ 
+-cfg.joint_pos95_warn_m = 15000;          % 位置95%不确定度预警门[m]
+-cfg.joint_pos95_down_m = 30000;          % 位置95%不确定度降级门[m]
+-cfg.joint_pos95_recover_m = 10000;       % 位置95%不确定度恢复门[m]
+-cfg.joint_radial95_warn_m = 10000;       % 径向95%不确定度预警门[m]
+-cfg.joint_radial95_down_m = 20000;       % 径向95%不确定度降级门[m]
+-cfg.joint_radial95_recover_m = 7000;     % 径向95%不确定度恢复门[m]
+-cfg.joint_relative_range_down = 0.60;    % 相对距离不确定度降级门
++% 三维正式输出的降维申请只由两个物理量控制：
++%   1) 径向距离1-sigma不确定度 sigma_r；
++%   2) 最近一次可靠主动三维距离更新距当前时刻的龄期。
++% 预警采用 OR，正式降维申请采用 AND；实际切换仍需二维分支 ready
++% 且二维/三维角度投影一致，保持事务式 pending/commit 语义。
++cfg.joint_radial_sigma_warn_m = 5000;    % 径向距离1-sigma不确定度预警门[m]
++cfg.joint_radial_sigma_drop_m = 10000;   % 径向距离1-sigma不确定度降维门[m]
++cfg.joint_range_age_warn_s = 3;          % 可靠主动三维距离信息龄期预警门[s]
++cfg.joint_range_age_drop_s = 10;         % 可靠主动三维距离信息龄期降维门[s]
+ 
+-cfg.joint_space_nis_window = 5;          % 空间NIS滑窗长度
+-cfg.joint_space_nis_recover = 1.5;       % 空间NIS恢复门
+-cfg.joint_space_nis_warn = 2.5;          % 空间NIS预警门
+-cfg.joint_space_nis_down = 4.0;          % 空间NIS降级门
++% 以下旧质量量仅保留为诊断标尺，不再直接参与3D->2D降维判决。
++cfg.joint_pos95_warn_m = 15000;          % 位置95%不确定度诊断阈值[m]
++cfg.joint_pos95_down_m = 30000;          % 位置95%不确定度诊断阈值[m]
++cfg.joint_pos95_recover_m = 10000;       % 位置95%不确定度诊断阈值[m]
++cfg.joint_radial95_warn_m = 10000;       % 径向95%不确定度诊断阈值[m]
++cfg.joint_radial95_down_m = 20000;       % 径向95%不确定度诊断阈值[m]
++cfg.joint_radial95_recover_m = 7000;     % 径向95%不确定度诊断阈值[m]
++cfg.joint_relative_range_down = 0.60;    % 相对距离不确定度诊断阈值
++
++cfg.joint_space_nis_window = 5;          % 空间NIS诊断滑窗长度
++cfg.joint_space_nis_recover = 1.5;       % 空间NIS诊断阈值
++cfg.joint_space_nis_warn = 2.5;          % 空间NIS诊断阈值
++cfg.joint_space_nis_down = 4.0;          % 空间NIS诊断阈值
+ cfg.joint_shadow_max_s = 20;             % 降维后三维影子状态最长保留时间[s]
+ cfg.joint_mode_3d_prior_cost = 0.5;       % 通用空间分支三维关联优先代价
+ 
+--- validate_config_fusion.m
++++ validate_config_fusion.m
+@@ -190,6 +190,10 @@
+ cfg = set_default(cfg, 'joint_up_consecutive', 1);
+ cfg = set_default(cfg, 'joint_down_consecutive', 3);
+ cfg = set_default(cfg, 'joint_quality_eval_interval_s', 0.10);
++cfg = set_default(cfg, 'joint_radial_sigma_warn_m', 5000);
++cfg = set_default(cfg, 'joint_radial_sigma_drop_m', 10000);
++cfg = set_default(cfg, 'joint_range_age_warn_s', 3);
++cfg = set_default(cfg, 'joint_range_age_drop_s', 10);
+ cfg = set_default(cfg, 'joint_pos95_warn_m', 15000);
+ cfg = set_default(cfg, 'joint_pos95_down_m', 30000);
+ cfg = set_default(cfg, 'joint_pos95_recover_m', 10000);
+@@ -411,6 +415,10 @@
+ validate_m_of_n(cfg.joint_3d_upgrade_M, cfg.joint_3d_upgrade_N, 'joint_3d_upgrade');
+ must_be_positive_integer(cfg.joint_up_consecutive, 'cfg.joint_up_consecutive');
+ must_be_positive_integer(cfg.joint_down_consecutive, 'cfg.joint_down_consecutive');
++must_be_positive(cfg.joint_radial_sigma_warn_m, 'cfg.joint_radial_sigma_warn_m');
++must_be_positive(cfg.joint_radial_sigma_drop_m, 'cfg.joint_radial_sigma_drop_m');
++must_be_positive(cfg.joint_range_age_warn_s, 'cfg.joint_range_age_warn_s');
++must_be_positive(cfg.joint_range_age_drop_s, 'cfg.joint_range_age_drop_s');
+ must_be_positive_integer(cfg.joint_space_nis_window, 'cfg.joint_space_nis_window');
+ must_be_positive(cfg.joint_max_predict_dt_s, 'cfg.joint_max_predict_dt_s');
+ must_be_positive(cfg.joint_switch_gate_2d, 'cfg.joint_switch_gate_2d');
+@@ -451,6 +459,12 @@
+ must_be_nonnegative(cfg.joint_space_nis_recover, 'cfg.joint_space_nis_recover');
+ must_be_positive(cfg.joint_space_nis_warn, 'cfg.joint_space_nis_warn');
+ must_be_positive(cfg.joint_space_nis_down, 'cfg.joint_space_nis_down');
++if ~(cfg.joint_radial_sigma_warn_m < cfg.joint_radial_sigma_drop_m)
++    error('径向距离不确定度阈值要求 warn < drop');
++end
++if ~(cfg.joint_range_age_warn_s < cfg.joint_range_age_drop_s)
++    error('可靠主动三维距离信息龄期阈值要求 warn < drop');
++end
+ if ~(cfg.joint_pos95_recover_m < cfg.joint_pos95_warn_m && ...
+         cfg.joint_pos95_warn_m < cfg.joint_pos95_down_m)
+     error('三维位置门限要求 recover < warn < down');
+--- run_filter_joint_2d3d.m
++++ run_filter_joint_2d3d.m
+@@ -48,6 +48,10 @@
+     p.projection_cache_enabled, p.progress_interval_events);
+ fprintf('  三维伴随被动验收: NIS<=%.2f, 方位/俯仰残差<=%.3fdeg\n', ...
+     p.accept_nis_3d_companion, p.fast_gate_3d_companion_deg);
++fprintf(['  三维降维双指标: sigma_r预警/降级=%.0f/%.0fm, ', ...
++    '可靠主动距离龄期预警/降级=%.1f/%.1fs, 连续申请=%d\n'], ...
++    p.radial_sigma_warn_m, p.radial_sigma_drop_m, ...
++    p.range_age_warn_s, p.range_age_drop_s, p.down_consecutive);
+ if p.clutter_hardening_enabled
+@@ -165,6 +169,8 @@
+         if range_updated
+             tracks(ti).active_history(end) = 1;
+             tracks(ti).last_active_t = t;
++            tracks(ti).last_valid_range_t = max_finite( ...
++                tracks(ti).last_valid_range_t, t);
+         end
+@@ -534,9 +540,27 @@
+ if ~isfield(state, 'companions')
+     state.companions = defaults.companions;
+ end
++tracks_had_range_time = isempty(state.tracks) || ...
++    isfield(state.tracks, 'last_valid_range_t');
++companions_had_range_time = isempty(state.companions) || ...
++    isfield(state.companions, 'last_valid_range_t');
+ state.tracks = upgrade_track_array(state.tracks, track_template(state.params));
+ state.companions = upgrade_track_array( ...
+     state.companions, track_template(state.params));
++% Schema v8 and earlier used last_active_t as the closest available proxy
++% for the last reliable active range update. Preserve continuity when an
++% old streaming state is resumed; subsequent accepted range updates refine it.
++if ~tracks_had_range_time
++    for i = 1:numel(state.tracks)
++        state.tracks(i).last_valid_range_t = state.tracks(i).last_active_t;
++    end
++end
++if ~companions_had_range_time
++    for i = 1:numel(state.companions)
++        state.companions(i).last_valid_range_t = ...
++            state.companions(i).last_active_t;
++    end
++end
+@@ -557,7 +581,7 @@
+ function version = stream_schema_version()
+-version = 8;
++version = 9;
+ end
+@@ -658,6 +682,11 @@
+ p.quality_eval_interval_s = get_cfg(cfg, 'joint_quality_eval_interval_s', 0.10);
+ p.switch_gate = get_cfg(cfg, 'joint_switch_gate_2d', 9.2103);
+ p.switch_cov_inflate = get_cfg(cfg, 'joint_switch_cov_inflate', 2.0);
++p.radial_sigma_warn_m = get_cfg(cfg, 'joint_radial_sigma_warn_m', 5000);
++p.radial_sigma_drop_m = get_cfg(cfg, 'joint_radial_sigma_drop_m', 10000);
++p.range_age_warn_s = get_cfg(cfg, 'joint_range_age_warn_s', 3);
++p.range_age_drop_s = get_cfg(cfg, 'joint_range_age_drop_s', 10);
++% Legacy quality thresholds remain available as diagnostics only.
+@@ -756,6 +785,7 @@
+     'mode', 'tentative', 'age', 0, 'miss', 0, 'last_t', NaN, ...
+     'last_update_t', NaN, 'last_active_t', NaN, 'last_passive_t', NaN, ...
++    'last_valid_range_t', NaN, ...
+@@ -783,6 +813,7 @@
+     tr.space = init_space_branch(xyz, R_xyz, t, p);
+     tr.active_history(end) = 1;
+     tr.last_active_t = t;
++    tr.last_valid_range_t = t;
+@@ -1856,6 +1887,9 @@
+         c.last_t = t;
+         c.last_update_t = last_update(q);
+         c.last_active_t = last_active(q);
++        % Mature 3-D last_active_t is refreshed only by an accepted active
++        % Cartesian/range update, so it is the reliable range timestamp.
++        c.last_valid_range_t = last_active(q);
+@@ -1889,6 +1923,8 @@
+     companions(i).last_active_t = max_finite( ...
+         companions(i).last_active_t, last_active(q));
++    companions(i).last_valid_range_t = max_finite( ...
++        companions(i).last_valid_range_t, last_active(q));
+@@ -1947,7 +1983,7 @@
+-        companions(i).quality = assess_quality(companions(i), sensor, p);
++        companions(i).quality = assess_quality(companions(i), t, sensor, p);
+@@ -2288,7 +2324,7 @@
+-    companions(i).quality = assess_quality(companions(i), sensor, p);
++    companions(i).quality = assess_quality(companions(i), t, sensor, p);
+@@ -2444,6 +2480,7 @@
+     'birth_event', 0, 'birth_t', NaN, 'last_update_t', NaN, ...
++    'last_valid_range_t', NaN, ...
+@@ -2468,6 +2505,7 @@
+     s.last_update_t = tr.last_update_t;
++    s.last_valid_range_t = tr.last_valid_range_t;
+@@ -2616,6 +2654,8 @@
+ keep.last_update_t = max_finite(keep.last_update_t, drop.last_update_t);
+ keep.last_active_t = max_finite(keep.last_active_t, drop.last_active_t);
++keep.last_valid_range_t = max_finite( ...
++    keep.last_valid_range_t, drop.last_valid_range_t);
+@@ -2643,7 +2683,7 @@
+-    tr.quality = assess_quality(tr, sensor, p);
++    tr.quality = assess_quality(tr, t, sensor, p);
+@@ -2715,8 +2755,10 @@
+-function q = assess_quality(tr, sensor, p)
++function q = assess_quality(tr, t, sensor, p)
+ q = quality_template();
++q.last_valid_range_t = tr.last_valid_range_t;
++q.range_age_s = effective_range_age(t, tr.last_valid_range_t);
+@@ -2735,16 +2777,19 @@
+-    nis_warn = isfinite(q.nis_norm) && q.nis_norm > p.space_nis_warn;
+-    nis_down = isfinite(q.nis_norm) && q.nis_norm > p.space_nis_down;
+-    nis_recover = ~isfinite(q.nis_norm) || q.nis_norm <= p.space_nis_recover;
+-    q.warn3d = q.position95_m > p.pos95_warn_m || ...
+-        q.radial95_m > p.radial95_warn_m || nis_warn;
+-    q.down3d = q.position95_m > p.pos95_down_m || q.radial95_m > p.radial95_down_m || ...
+-        q.relative_range_sigma > p.relative_range_down || nis_down;
+-    q.valid3d = ~q.down3d;
+-    q.recover3d = q.position95_m <= p.pos95_recover_m && ...
+-        q.radial95_m <= p.radial95_recover_m && nis_recover;
++    % 3-D mode control intentionally uses only two physical quantities:
++    % radial 1-sigma range uncertainty and age of the last reliable active
++    % range update. Position95, relative uncertainty and NIS remain purely
++    % diagnostic so maneuver/model mismatch cannot directly force a drop.
++    q.radial_warn = q.radial_sigma_m >= p.radial_sigma_warn_m;
++    q.range_age_warn = q.range_age_s >= p.range_age_warn_s;
++    q.warn3d = q.radial_warn || q.range_age_warn;
++    q.degrade_request = q.radial_sigma_m >= p.radial_sigma_drop_m && ...
++        q.range_age_s >= p.range_age_drop_s;
++    q.down3d = q.degrade_request; % compatibility alias for existing manager
++    q.valid3d = ~q.degrade_request;
++    q.recover3d = q.radial_sigma_m < p.radial_sigma_warn_m && ...
++        q.range_age_s < p.range_age_warn_s;
+@@ -2779,10 +2824,12 @@
+ function q = quality_template()
+ q = struct('valid2d', false, 'valid3d', false, 'warn3d', false, ...
+-    'down3d', true, 'recover3d', false, 'switch_consistent', false, ...
+-    'observed2d', false, ...
++    'down3d', false, 'degrade_request', false, 'recover3d', false, ...
++    'switch_consistent', false, 'observed2d', false, ...
++    'radial_warn', false, 'range_age_warn', false, ...
+     'angle95_deg', inf, 'position95_m', inf, 'radial_sigma_m', inf, ...
+     'radial95_m', inf, 'relative_range_sigma', inf, 'range_m', NaN, ...
++    'range_age_s', inf, 'last_valid_range_t', NaN, ...
+@@ -2852,7 +2899,8 @@
+-s.mode = tr.mode; s.last_update_t = tr.last_update_t; s.truth_id = tr.truth_id;
++s.mode = tr.mode; s.last_update_t = tr.last_update_t;
++s.last_valid_range_t = tr.last_valid_range_t; s.truth_id = tr.truth_id;
+@@ -2860,7 +2908,8 @@
+ s = struct('id', 0, 'birth_event', 0, 'confirmed', false, 'mode', '', ...
+-    'last_update_t', NaN, 'truth_id', NaN, 'quality', quality_template(), ...
++    'last_update_t', NaN, 'last_valid_range_t', NaN, ...
++    'truth_id', NaN, 'quality', quality_template(), ...
+@@ -3092,6 +3141,14 @@
++function age = effective_range_age(t, t_valid)
++if isfinite(t) && isfinite(t_valid)
++    age = max(t - t_valid, 0);
++else
++    age = inf;
++end
++end
++
+ function y = max_finite(a, b)
